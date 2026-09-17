@@ -1,0 +1,18 @@
+Title: Password Reset Flow
+
+Description:
+As a registered user, I want to reset my password via email so that I can regain access
+to my account if I forget my password.
+
+Acceptance Criteria:
+1. User can request a password reset from the login page via a "Forgot password?" link.
+2. User enters their registered email address and submits.
+3. If the email exists in the system, a reset link is sent within 2 minutes, valid for 30 minutes.
+4. If the email does not exist, the system shows a generic message (does not reveal whether
+   the email is registered, for security reasons).
+5. Reset link takes the user to a page where they can enter a new password (min 8 characters,
+   must include at least 1 number and 1 special character).
+6. After successful reset, all existing sessions for that user are logged out.
+7. User receives a confirmation email after a successful password change.
+8. Reset link cannot be reused once it has been used successfully.
+9. Rate limit: max 3 reset requests per email per hour.

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "TC-EXAMPLE-1",
+    "title": "User can log in with valid credentials",
+    "requirement_ref": "Login flow",
+    "preconditions": "User has an active, verified account",
+    "steps": [
+      "Navigate to the login page",
+      "Enter a valid registered email",
+      "Enter the correct password",
+      "Click 'Log in'"
+    ],
+    "expected_result": "User is redirected to the dashboard and sees their account name in the header",
+    "priority": "High",
+    "type": "Functional"
+  },
+  {
+    "id": "TC-EXAMPLE-2",
+    "title": "User cannot log in with incorrect password",
+    "requirement_ref": "Login flow",
+    "preconditions": "User has an active account",
+    "steps": [
+      "Navigate to the login page",
+      "Enter a valid registered email",
+      "Enter an incorrect password",
+      "Click 'Log in'"
+    ],
+    "expected_result": "Login is rejected with a generic 'Invalid email or password' error; no indication of which field was wrong",
+    "priority": "High",
+    "type": "Negative"
+  }
+]
