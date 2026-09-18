@@ -32,7 +32,7 @@ from openpyxl.worksheet.dimensions import ColumnDimension, RowDimension
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
 except ImportError:
     pass  # dotenv is optional; env vars can be set directly
 
@@ -161,7 +161,9 @@ SYSTEM_PROMPT = """You are a senior QA engineer generating detailed manual test 
 
 You are generating an execution-ready QA workbook. Analyze the feature before writing cases: identify actors and roles, entry points, pages, fields, controls, business rules, validations, dependencies, permissions, status transitions, related modules, data relationships, boundary values, error states, navigation paths, persistence, integrations, UI requirements, automation opportunities, and regression impact.
 
-Uploaded Figma screenshots or UI reference images are authoritative visual source material when provided. Use only text and visual details that are readable in the images. Do not invent UI labels, messages, controls, limits, or behavior that cannot be established from the story, requirements, or images.
+Uploaded Figma screenshots or UI reference images are authoritative visual source material when provided. Use only text and visual details that are readable in the images. Do not invent UI labels, messages, controls, limits, or behavior that cannot be established from the story, requirements, comments, or images.
+
+Jira comments are included under `Comments / Clarifications`. Treat comments as authoritative clarifications or supplementary requirements when they resolve an ambiguity or gap in the story. Do not treat unrelated discussion, status updates, or opinions as requirements. If comments conflict with the story or acceptance criteria, flag the conflict in `open_questions` instead of silently choosing one.
 
 Coverage must include every applicable scenario without mechanically inventing irrelevant cases:
 - Positive, negative, validation, UI, functional, regression, integration, boundary, and edge scenarios.
@@ -310,8 +312,10 @@ def fetch_jira_ticket(
         sys.exit(1)
 
     jira_id = extract_jira_id(ticket_id)
+    auth = HTTPBasicAuth(email, token)
+    headers = {"Accept": "application/json"}
     url = f"{base_url.rstrip('/')}/rest/api/3/issue/{jira_id}"
-    resp = requests.get(url, auth=HTTPBasicAuth(email, token), headers={"Accept": "application/json"})
+    resp = requests.get(url, auth=auth, headers=headers)
     if resp.status_code == 404:
         raise RuntimeError(
             f"Jira issue {jira_id} was not found at {base_url}. "
@@ -329,7 +333,42 @@ def fetch_jira_ticket(
     summary = fields.get("summary", "")
     description = _adf_to_text(fields.get("description"))
 
-    return f"Title: {summary}\n\nDescription / Acceptance Criteria:\n{description}"
+    comments_url = f"{base_url.rstrip('/')}/rest/api/3/issue/{jira_id}/comment"
+    comments = []
+    start_at = 0
+    while True:
+        comments_response = requests.get(
+            comments_url,
+            auth=auth,
+            headers=headers,
+            params={"startAt": start_at, "maxResults": 100},
+        )
+        if comments_response.status_code in {401, 403}:
+            raise RuntimeError(
+                f"Jira returned {comments_response.status_code} while reading comments. "
+                "Check the API user's comment-view permission for this project."
+            )
+        if not comments_response.ok:
+            break
+        page = comments_response.json()
+        page_comments = page.get("comments", [])
+        comments.extend(page_comments)
+        start_at += len(page_comments)
+        if not page_comments or start_at >= page.get("total", start_at):
+            break
+
+    comment_text = []
+    for comment in comments:
+        body = _adf_to_text(comment.get("body"))
+        if not body:
+            continue
+        author = (comment.get("author") or {}).get("displayName", "Unknown author")
+        created = comment.get("created", "")
+        comment_text.append(f"[{created}] {author}:\n{body}")
+
+    comments_section = "\n\nComments / Clarifications:\n" + "\n\n".join(comment_text) if comment_text else ""
+
+    return f"Title: {summary}\n\nDescription / Acceptance Criteria:\n{description}{comments_section}"
 
 
 def _adf_to_text(adf) -> str:
