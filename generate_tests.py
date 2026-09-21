@@ -49,6 +49,7 @@ MODEL_OPTIONS = {
     "ChatGPT": "openai/gpt-4o",
     "NVIDIA Nemotron 3": DEFAULT_MODEL,
 }
+MAX_REQUIREMENT_CHUNK_CHARS = 4_000
 
 # ---------------------------------------------------------------------------
 # Excel columns must remain in this order for downstream test-management import.
@@ -584,7 +585,7 @@ def validate_generated_result(result: dict) -> dict:
     return result
 
 
-def generate_test_cases(
+def _generate_test_case_batch(
     client: OpenAI,
     requirement_text: str,
     few_shot: str,
@@ -623,6 +624,87 @@ def generate_test_cases(
         return validate_generated_result(_extract_tool_result(response))
     except (RuntimeError, ValueError):
         return _generate_json_fallback(client, requirement_text, few_shot, images, model)
+
+
+def _split_requirement_for_generation(requirement_text: str) -> list[str]:
+    """Split long PRDs on paragraph boundaries so one response is not truncated.
+
+    A very detailed story can require more output than a provider permits in one
+    response. Each returned batch is independently valid, then all batches are
+    merged below. Short stories retain the existing single-request behavior.
+    """
+    if len(requirement_text) <= MAX_REQUIREMENT_CHUNK_CHARS:
+        return [requirement_text]
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", requirement_text) if part.strip()]
+    title = next((part for part in paragraphs if part.casefold().startswith("title:")), "")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for paragraph in paragraphs:
+        paragraph_length = len(paragraph) + 2
+        if current and current_length + paragraph_length > MAX_REQUIREMENT_CHUNK_CHARS:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_length = 0
+        # An unusually long paragraph is still kept intact; breaking a
+        # requirement sentence risks splitting its condition from its outcome.
+        current.append(paragraph)
+        current_length += paragraph_length
+    if current:
+        chunks.append("\n\n".join(current))
+
+    if title:
+        return [chunk if chunk.startswith(title) else f"{title}\n\n{chunk}" for chunk in chunks]
+    return chunks
+
+
+def _merge_generated_batches(results: list[dict]) -> dict:
+    """Merge batches while retaining the first version of any duplicate scenario."""
+    merged_cases = []
+    open_questions = []
+    seen_scenarios = set()
+    seen_questions = set()
+    for result in results:
+        for test_case in result.get("test_cases", []):
+            scenario_key = str(test_case.get("scenario", "")).strip().casefold()
+            if scenario_key and scenario_key not in seen_scenarios:
+                seen_scenarios.add(scenario_key)
+                merged_cases.append(test_case)
+        for question in result.get("open_questions") or []:
+            question_key = str(question).strip().casefold()
+            if question_key and question_key not in seen_questions:
+                seen_questions.add(question_key)
+                open_questions.append(question)
+    return validate_generated_result({"test_cases": merged_cases, "open_questions": open_questions})
+
+
+def generate_test_cases(
+    client: OpenAI,
+    requirement_text: str,
+    few_shot: str,
+    images: list[tuple[str, bytes]] | None = None,
+    model: str = MODEL,
+) -> dict:
+    """Generate complete coverage, batching long stories to prevent output loss."""
+    chunks = _split_requirement_for_generation(requirement_text)
+    if len(chunks) == 1:
+        return _generate_test_case_batch(client, requirement_text, few_shot, images, model)
+
+    results = []
+    for batch_number, chunk in enumerate(chunks, start=1):
+        batch_prompt = (
+            f"This is part {batch_number} of {len(chunks)} of one requirement. "
+            "Generate cases only for functionality explicitly present in this part. "
+            "Do not omit detailed conditions, validations, visibility rules, limits, "
+            "or state changes from this part, and do not recreate general cases from other parts.\n\n"
+            + chunk
+        )
+        # Images can be expensive to repeat. They are retained for a normal
+        # single-response story; detailed long stories rely on their written
+        # requirements unless their image source is split in a future pass.
+        results.append(_generate_test_case_batch(client, batch_prompt, few_shot, None, model))
+    return _merge_generated_batches(results)
 
 
 def self_review(client: OpenAI, requirement_text: str, result: dict, model: str = MODEL) -> dict:
