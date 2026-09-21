@@ -66,6 +66,20 @@ Requirement:
 {requirement}
 """
 
+COVERAGE_AUDIT_PROMPT = """Review the generated QA test scenarios against the complete requirement.
+
+Return ONLY valid JSON in this exact shape:
+{{"missing_coverage": ["specific requirement, acceptance criterion, validation, state, or dependency that has no adequate scenario"]}}
+
+List only genuinely uncovered items. Do not request duplicate cases, out-of-scope work, or behavior that is not specified. An empty list means every explicit requirement is covered by at least one scenario.
+
+Requirement:
+{requirement}
+
+Generated scenarios:
+{scenarios}
+"""
+
 # ---------------------------------------------------------------------------
 # Excel columns must remain in this order for downstream test-management import.
 WORKBOOK_COLUMNS = [
@@ -759,6 +773,60 @@ Full requirement source (use it only to understand the assigned scope and its de
     )
 
 
+def _find_missing_coverage(client: OpenAI, requirement_text: str, result: dict, model: str) -> list[str]:
+    """Use a small review response to find explicit requirements without a case."""
+    scenario_summary = [
+        {"scenario": case.get("scenario", ""), "description": case.get("description", "")}
+        for case in result.get("test_cases", [])
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            max_tokens=1600,
+            messages=[
+                {
+                    "role": "user",
+                    "content": COVERAGE_AUDIT_PROMPT.format(
+                        requirement=requirement_text,
+                        scenarios=json.dumps(scenario_summary, ensure_ascii=False),
+                    ),
+                }
+            ],
+            response_format={"type": "json_object"},
+        )
+        audit = _parse_model_json((response.choices[0].message.content or "").strip())
+        missing_coverage = audit.get("missing_coverage", [])
+        if not isinstance(missing_coverage, list):
+            return []
+        return [str(item).strip() for item in missing_coverage if str(item).strip()][:20]
+    except Exception:
+        # Generation remains available if a provider does not support JSON mode
+        # for the lightweight audit request.
+        return []
+
+
+def _generate_missing_coverage(
+    client: OpenAI,
+    requirement_text: str,
+    few_shot: str,
+    missing_coverage: list[str],
+    model: str,
+) -> dict:
+    prompt = f"""Generate additional test cases only for the uncovered requirement points below.
+
+Do not repeat existing scenarios. Each point must receive one or more independently executable test cases with observable expected results.
+
+Uncovered points:
+{json.dumps(missing_coverage, ensure_ascii=False, indent=2)}
+
+Full requirement source:
+{requirement_text}
+"""
+    return _generate_test_case_batch(
+        client, prompt, few_shot, images=None, model=model, max_tokens=LONG_REQUIREMENT_BATCH_TOKENS
+    )
+
+
 def generate_test_cases(
     client: OpenAI,
     requirement_text: str,
@@ -774,34 +842,54 @@ def generate_test_cases(
     if progress_callback:
         progress_callback("Planning complete coverage for this detailed requirement...")
     groups = _plan_coverage_groups(client, requirement_text, model)
-    if progress_callback:
+    if progress_callback and ":free" not in model:
         progress_callback("Generating two focused coverage groups in parallel...")
 
     results: list[dict | None] = [None, None]
-    failures: list[int] = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {
-            executor.submit(_generate_coverage_group, client, requirement_text, few_shot, group, model): index
-            for index, group in enumerate(groups)
-        }
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                results[index] = future.result()
-            except Exception:
-                failures.append(index)
-
-    # Free models can reject simultaneous calls. Keep NVIDIA usable by retrying
-    # only a throttled/failed group sequentially rather than losing the run.
-    for index in failures:
+    if ":free" in model:
         if progress_callback:
-            progress_callback(f"Retrying coverage group {index + 1} after provider throttling...")
-        results[index] = _generate_coverage_group(client, requirement_text, few_shot, groups[index], model)
+            progress_callback("Generating focused coverage groups sequentially for NVIDIA free-tier reliability...")
+        for index, group in enumerate(groups):
+            if progress_callback:
+                progress_callback(f"Generating coverage group {index + 1} of {len(groups)}...")
+            results[index] = _generate_coverage_group(client, requirement_text, few_shot, group, model)
+    else:
+        failures: list[int] = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(_generate_coverage_group, client, requirement_text, few_shot, group, model): index
+                for index, group in enumerate(groups)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    results[index] = future.result()
+                except Exception:
+                    failures.append(index)
+
+        for index in failures:
+            if progress_callback:
+                progress_callback(f"Retrying coverage group {index + 1} after provider throttling...")
+            results[index] = _generate_coverage_group(client, requirement_text, few_shot, groups[index], model)
 
     if progress_callback:
         progress_callback("Combining coverage groups and validating the workbook data...")
     results = [result for result in results if result is not None]
-    return _merge_generated_batches(results)
+    merged_result = _merge_generated_batches(results)
+    if progress_callback:
+        progress_callback("Auditing scenario traceability against the complete requirement...")
+    missing_coverage = _find_missing_coverage(client, requirement_text, merged_result, model)
+    if missing_coverage:
+        if progress_callback:
+            progress_callback(f"Generating targeted cases for {len(missing_coverage)} uncovered requirement point(s)...")
+        merged_result = _merge_generated_batches(
+            [merged_result, _generate_missing_coverage(client, requirement_text, few_shot, missing_coverage, model)]
+        )
+    merged_result["coverage_audit"] = {
+        "missing_points_addressed": len(missing_coverage),
+        "status": "reviewed",
+    }
+    return merged_result
 
 
 def self_review(client: OpenAI, requirement_text: str, result: dict, model: str = MODEL) -> dict:
