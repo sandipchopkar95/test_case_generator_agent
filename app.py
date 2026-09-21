@@ -4,6 +4,7 @@ import os
 import json
 import tempfile
 import time
+from hmac import compare_digest
 from pathlib import Path
 
 import extra_streamlit_components as stx
@@ -22,8 +23,14 @@ from generate_tests import (
     load_few_shot_examples,
     write_workbook,
 )
+from learning_memory import (
+    build_learning_context,
+    clear_learning_records,
+    create_learning_repository,
+    learning_record_count,
+    save_generation,
+)
 
-OUTPUT_PATH = Path(__file__).with_name("generated_test_cases.xlsx")
 SETTINGS_COOKIE = "qa_test_case_generator_settings"
 COOKIE_MAX_AGE = 10 * 365 * 24 * 60 * 60
 
@@ -35,7 +42,37 @@ if isinstance(saved_settings, str):
     except json.JSONDecodeError:
         saved_settings = {}
 
+
+def _streamlit_secret(name: str) -> str:
+    """Read a deployment secret without requiring it during local development."""
+    try:
+        return str(st.secrets.get(name, os.environ.get(name, "")))
+    except (FileNotFoundError, AttributeError):
+        return os.environ.get(name, "")
+
+
+LEARNING_REPOSITORY = create_learning_repository(
+    _streamlit_secret("MONGODB_URI"), _streamlit_secret("MONGODB_DATABASE")
+)
+
+
+def _require_team_access() -> None:
+    """Optionally restrict the public deployment before it can use shared memory."""
+    expected_password = _streamlit_secret("APP_ACCESS_PASSWORD")
+    if not expected_password or st.session_state.get("team_access_granted"):
+        return
+    st.title("QA Test Case Generator")
+    supplied_password = st.text_input("Team access password", type="password")
+    if supplied_password:
+        if compare_digest(supplied_password, expected_password):
+            st.session_state["team_access_granted"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect team access password.")
+    st.stop()
+
 st.set_page_config(page_title="QA Test Case Generator", page_icon="✓", layout="wide")
+_require_team_access()
 
 st.markdown(
     """
@@ -52,7 +89,7 @@ st.caption("Turn a Jira issue or pasted story into an execution-ready Excel work
 
 with st.sidebar:
     with st.expander("Settings", expanded=False):
-        st.caption("Settings are saved in this browser until you clear them or clear site cookies.")
+        st.caption("Only non-secret settings are saved in this browser. Enter API keys and tokens for each new session.")
         if st.button("Clear saved settings", use_container_width=True):
             cookie_manager.delete(SETTINGS_COOKIE)
             st.rerun()
@@ -69,7 +106,7 @@ with st.sidebar:
         selected_model = MODEL_OPTIONS[model_label]
         openrouter_api_key = st.text_input(
             f"OpenRouter API key for {model_label}",
-            value=saved_settings.get("openrouter_api_key", ""),
+            value="",
             type="password",
             placeholder=f"Enter your OpenRouter key for {model_label}",
             help=f"Required to use {model_label} through OpenRouter.",
@@ -81,12 +118,12 @@ with st.sidebar:
         )
         jira_email = st.text_input(
             "Jira email",
-            value=saved_settings.get("jira_email", ""),
+            value="",
             placeholder="name@company.com",
         )
         jira_api_token = st.text_input(
             "Jira API token",
-            value=saved_settings.get("jira_api_token", ""),
+            value="",
             type="password",
             placeholder="Enter your Jira API token",
             help="Required when using a Jira issue link or key.",
@@ -95,10 +132,7 @@ with st.sidebar:
             SETTINGS_COOKIE,
             json.dumps(
                 {
-                    "openrouter_api_key": openrouter_api_key,
                     "jira_base_url": jira_base_url,
-                    "jira_email": jira_email,
-                    "jira_api_token": jira_api_token,
                     "model_label": model_label,
                 }
             ),
@@ -147,6 +181,25 @@ with st.sidebar:
     examples_path = Path(__file__).with_name("examples.json")
     use_examples = st.checkbox("Use team examples", value=examples_path.exists())
 
+    st.divider()
+    st.header("Past-work learning")
+    use_learning = st.checkbox(
+        "Use and remember past work",
+        value=True,
+        help="Successful generations are saved only in this project and relevant past examples guide future work. This does not train the AI provider's model.",
+    )
+    try:
+        learned_count = learning_record_count(LEARNING_REPOSITORY)
+        memory_location = "shared cloud memory" if LEARNING_REPOSITORY.is_cloud else "local memory"
+        st.caption(f"{learned_count} saved generation{'s' if learned_count != 1 else ''} in {memory_location}.")
+    except RuntimeError as error:
+        learned_count = 0
+        use_learning = False
+        st.warning(f"Past-work learning is unavailable: {error}")
+    if st.button("Clear past-work memory", use_container_width=True, disabled=not learned_count):
+        clear_learning_records(LEARNING_REPOSITORY)
+        st.rerun()
+
 source = st.radio("Requirement source", ["Jira link", "Pasted story"], horizontal=True)
 
 if source == "Jira link":
@@ -169,8 +222,6 @@ generate_clicked = st.button("Generate test cases", type="primary", use_containe
 
 if generate_clicked:
     started_at = time.monotonic()
-    if OUTPUT_PATH.exists():
-        OUTPUT_PATH.unlink()
     st.session_state.pop("download_bytes", None)
     st.session_state.pop("download_name", None)
     st.session_state.pop("preview_rows", None)
@@ -213,6 +264,9 @@ if generate_clicked:
 
             template_path = None
             temporary_template = None
+            temporary_output = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+            output_path = Path(temporary_output.name)
+            temporary_output.close()
             if template_upload is not None:
                 generation_status.write("Loading the Excel template...")
                 temporary_template = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
@@ -223,16 +277,26 @@ if generate_clicked:
             try:
                 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=configured_openrouter_key)
                 few_shot = load_few_shot_examples(str(examples_path)) if use_examples else ""
+                learning_context, reference_count = ("", 0)
+                if use_learning:
+                    learning_context, reference_count = build_learning_context(
+                        requirement_text, LEARNING_REPOSITORY
+                    )
                 figma_images = [(upload.name, upload.getvalue()) for upload in figma_uploads]
+                reference_suffix = (
+                    f" with {reference_count} relevant past-work reference(s)" if reference_count else ""
+                )
+                image_suffix = (
+                    f" and {len(figma_images)} visual reference(s)" if figma_images else ""
+                )
                 generation_status.write(
-                    f"Generating detailed test cases with {model_label}"
-                    + (f" using {len(figma_images)} visual reference(s)..." if figma_images else "...")
+                    f"Generating detailed test cases with {model_label}{reference_suffix}{image_suffix}..."
                 )
                 progress_bar.progress(30, text="Generating test cases... This may take a moment.")
                 result = generate_test_cases(
                     client,
                     requirement_text,
-                    few_shot,
+                    few_shot + learning_context,
                     images=figma_images,
                     model=selected_model,
                 )
@@ -240,18 +304,25 @@ if generate_clicked:
                 progress_bar.progress(75, text="Building the Excel workbook...")
                 write_workbook(
                     result,
-                    str(OUTPUT_PATH),
+                    str(output_path),
                     jira_id,
                     template_path=template_path,
                     metadata=metadata,
                 )
+                if use_learning:
+                    try:
+                        save_generation(requirement_text, jira_id, result, LEARNING_REPOSITORY)
+                    except RuntimeError as error:
+                        generation_status.write(f"Workbook is ready, but past-work memory was not updated: {error}")
+                download_bytes = output_path.read_bytes()
                 generation_status.write("Workbook validated. Preparing preview and download...")
                 progress_bar.progress(95, text="Preparing download...")
             finally:
                 if temporary_template:
                     Path(temporary_template.name).unlink(missing_ok=True)
+                output_path.unlink(missing_ok=True)
 
-            st.session_state["download_bytes"] = OUTPUT_PATH.read_bytes()
+            st.session_state["download_bytes"] = download_bytes
             st.session_state["download_name"] = f"{jira_id}_test_cases.xlsx"
             st.session_state["scenario_count"] = len(result.get("test_cases", []))
             st.session_state["preview_rows"] = [

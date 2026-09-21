@@ -30,6 +30,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.dimensions import ColumnDimension, RowDimension
 
+from learning_memory import DEFAULT_LEARNING_STORE, build_learning_context, create_learning_repository, save_generation
+
 try:
     from dotenv import load_dotenv
     load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
@@ -315,7 +317,7 @@ def fetch_jira_ticket(
     auth = HTTPBasicAuth(email, token)
     headers = {"Accept": "application/json"}
     url = f"{base_url.rstrip('/')}/rest/api/3/issue/{jira_id}"
-    resp = requests.get(url, auth=auth, headers=headers)
+    resp = requests.get(url, auth=auth, headers=headers, timeout=30)
     if resp.status_code == 404:
         raise RuntimeError(
             f"Jira issue {jira_id} was not found at {base_url}. "
@@ -342,6 +344,7 @@ def fetch_jira_ticket(
             auth=auth,
             headers=headers,
             params={"startAt": start_at, "maxResults": 100},
+            timeout=30,
         )
         if comments_response.status_code in {401, 403}:
             raise RuntimeError(
@@ -854,6 +857,18 @@ def main():
     parser.add_argument("--output", default="test_cases.xlsx", help="Output workbook path (default: test_cases.xlsx)")
     parser.add_argument("--examples", help="Optional path to a JSON file of few-shot example test cases.")
     parser.add_argument(
+        "--learning-store",
+        default=str(DEFAULT_LEARNING_STORE),
+        help="Local JSON memory for offline use when MongoDB is not configured.",
+    )
+    parser.add_argument("--mongodb-uri", help="MongoDB Atlas URI for shared team learning memory.")
+    parser.add_argument("--mongodb-database", help="MongoDB database name (default: test-case-learning).")
+    parser.add_argument(
+        "--no-learning",
+        action="store_true",
+        help="Do not use or save local past-work references for this run.",
+    )
+    parser.add_argument(
         "--self-review",
         action="store_true",
         help="Run a second pass where the model critiques and improves its own coverage.",
@@ -885,15 +900,30 @@ def main():
         jira_id = extract_jira_id(args.jira_ticket)
 
     few_shot = load_few_shot_examples(args.examples)
+    learning_context = ""
+    reference_count = 0
+    learning_repository = create_learning_repository(
+        args.mongodb_uri, args.mongodb_database, args.learning_store
+    )
+    if not args.no_learning:
+        learning_context, reference_count = build_learning_context(
+            requirement_text, learning_repository
+        )
+    if reference_count:
+        print(f"Using {reference_count} relevant past-work reference(s).")
 
     print(f"Generating test cases with {MODEL}...")
-    result = generate_test_cases(client, requirement_text, few_shot)
+    result = generate_test_cases(client, requirement_text, few_shot + learning_context)
 
     if args.self_review:
         print("Running self-review pass...")
         result = self_review(client, requirement_text, result)
 
     write_workbook(result, args.output, jira_id, args.template)
+    if not args.no_learning:
+        save_generation(requirement_text, jira_id, result, learning_repository)
+        location = "shared cloud" if learning_repository.is_cloud else "local"
+        print(f"Saved this successful generation to {location} past-work memory.")
 
 
 if __name__ == "__main__":
