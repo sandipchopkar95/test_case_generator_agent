@@ -409,7 +409,7 @@ def _extract_tool_result(response) -> dict:
     if tool_calls:
         for call in tool_calls:
             if call.function.name == "submit_test_cases":
-                return json.loads(call.function.arguments)
+                return _parse_model_json(call.function.arguments)
 
     # Fallback: model replied in plain text instead of calling the tool.
     content = (message.content or "").strip()
@@ -420,13 +420,39 @@ def _extract_tool_result(response) -> dict:
         content = content.strip()
     if content:
         try:
-            return json.loads(content)
-        except json.JSONDecodeError:
+            return _parse_model_json(content)
+        except ValueError:
             pass
 
     raise RuntimeError(
         "Model did not return structured test cases as expected. Raw response:\n" + str(message)
     )
+
+
+def _parse_model_json(content: str) -> dict:
+    """Parse model JSON, repairing small syntax defects common in long LLM output."""
+    # Some reasoning models occasionally start a step object as `['name': ...]`
+    # instead of `[{"name": ...}]`. Repair that precise structural typo before
+    # attempting normal JSON parsing.
+    content = re.sub(
+        r'("steps"\s*:\s*)\[\s*"(?=(?:name|instruction|expected_result)"\s*:)',
+        r'\1[{"',
+        content,
+    )
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError as original_error:
+        try:
+            from json_repair import repair_json
+
+            result = repair_json(content, return_objects=True)
+        except Exception as repair_error:
+            raise ValueError("Model response is not valid JSON.") from repair_error
+        if not isinstance(result, dict):
+            raise ValueError("Repaired model response is not a JSON object.") from original_error
+    if not isinstance(result, dict):
+        raise ValueError("Model response is not a JSON object.")
+    return result
 
 
 def _image_data_url(image: tuple[str, bytes]) -> str:
@@ -479,7 +505,7 @@ Requirement:
 """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT + "\nReturn JSON in the user-requested shape if tool calling is unavailable."},
-        {"role": "user", "content": _multimodal_user_content(fallback_prompt + few_shot, images)},
+        {"role": "user", "content": _multimodal_user_content(fallback_prompt, images)},
     ]
     try:
         response = client.chat.completions.create(
@@ -595,7 +621,7 @@ def generate_test_cases(
 
     try:
         return validate_generated_result(_extract_tool_result(response))
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         return _generate_json_fallback(client, requirement_text, few_shot, images, model)
 
 
