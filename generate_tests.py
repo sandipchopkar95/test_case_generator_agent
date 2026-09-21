@@ -20,8 +20,10 @@ import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 from openai import OpenAI
@@ -50,6 +52,19 @@ MODEL_OPTIONS = {
     "NVIDIA Nemotron 3": DEFAULT_MODEL,
 }
 MAX_REQUIREMENT_CHUNK_CHARS = 4_000
+LONG_REQUIREMENT_THRESHOLD = 8_000
+LONG_REQUIREMENT_BATCH_TOKENS = 12_288
+
+COVERAGE_PLAN_PROMPT = """Analyze the requirement below and return ONLY valid JSON.
+
+Create exactly two balanced, non-overlapping QA coverage groups. Together they must cover every requirement, clarification, validation, visibility rule, boundary, and dependency. Do not generate test cases. Each scope must name the feature areas and details it owns so a QA engineer can generate cases only for that scope.
+
+Return exactly:
+{{"groups": [{{"name": "...", "scope": "..."}}, {{"name": "...", "scope": "..."}}]}}
+
+Requirement:
+{requirement}
+"""
 
 # ---------------------------------------------------------------------------
 # Excel columns must remain in this order for downstream test-management import.
@@ -491,6 +506,7 @@ def _generate_json_fallback(
     few_shot: str,
     images: list[tuple[str, bytes]] | None = None,
     model: str = MODEL,
+    max_tokens: int = 12288,
 ) -> dict:
     """Retry without tool calling for models that return reasoning but no tool call."""
     fallback_prompt = f"""Return ONLY valid JSON. Do not explain your reasoning and do not use markdown.
@@ -511,18 +527,18 @@ Requirement:
     try:
         response = client.chat.completions.create(
             model=model,
-            max_tokens=12288,
+            max_tokens=max_tokens,
             messages=messages,
             response_format={"type": "json_object"},
         )
         return validate_generated_result(_extract_tool_result(response))
     except Exception as structured_error:
         if images and _is_image_support_error(structured_error):
-            return _generate_json_fallback(client, requirement_text, few_shot, images=None, model=model)
+            return _generate_json_fallback(client, requirement_text, few_shot, images=None, model=model, max_tokens=max_tokens)
         try:
             response = client.chat.completions.create(
                 model=model,
-                max_tokens=12288,
+                max_tokens=max_tokens,
                 messages=messages,
             )
             return validate_generated_result(_extract_tool_result(response))
@@ -591,13 +607,14 @@ def _generate_test_case_batch(
     few_shot: str,
     images: list[tuple[str, bytes]] | None = None,
     model: str = MODEL,
+    max_tokens: int = 8192,
 ) -> dict:
     user_content = _multimodal_user_content(requirement_text + few_shot, images)
 
     try:
         response = client.chat.completions.create(
             model=model,
-            max_tokens=8192,
+            max_tokens=max_tokens,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
@@ -609,7 +626,7 @@ def _generate_test_case_batch(
         if images and _is_image_support_error(error):
             response = client.chat.completions.create(
                 model=model,
-                max_tokens=8192,
+                max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": requirement_text + few_shot},
@@ -623,7 +640,7 @@ def _generate_test_case_batch(
     try:
         return validate_generated_result(_extract_tool_result(response))
     except (RuntimeError, ValueError):
-        return _generate_json_fallback(client, requirement_text, few_shot, images, model)
+        return _generate_json_fallback(client, requirement_text, few_shot, images, model, max_tokens=max_tokens)
 
 
 def _split_requirement_for_generation(requirement_text: str) -> list[str]:
@@ -679,31 +696,111 @@ def _merge_generated_batches(results: list[dict]) -> dict:
     return validate_generated_result({"test_cases": merged_cases, "open_questions": open_questions})
 
 
+def _fallback_coverage_groups(requirement_text: str) -> list[dict]:
+    """Create two balanced scopes without an AI planning response if needed."""
+    chunks = _split_requirement_for_generation(requirement_text)
+    midpoint = max(1, (len(chunks) + 1) // 2)
+    return [
+        {"name": "Requirement coverage group 1", "scope": "\n\n".join(chunks[:midpoint])},
+        {"name": "Requirement coverage group 2", "scope": "\n\n".join(chunks[midpoint:])},
+    ]
+
+
+def _plan_coverage_groups(client: OpenAI, requirement_text: str, model: str) -> list[dict]:
+    """Use a small response to assign the full requirement to two QA scopes."""
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            max_tokens=1200,
+            messages=[{"role": "user", "content": COVERAGE_PLAN_PROMPT.format(requirement=requirement_text)}],
+            response_format={"type": "json_object"},
+        )
+        planned = _parse_model_json((response.choices[0].message.content or "").strip())
+        groups = planned.get("groups")
+        if not isinstance(groups, list) or len(groups) != 2:
+            raise ValueError("Coverage plan did not contain two groups.")
+        normalised = [
+            {"name": str(group.get("name", "")).strip(), "scope": str(group.get("scope", "")).strip()}
+            for group in groups
+            if isinstance(group, dict)
+        ]
+        if len(normalised) != 2 or any(not group["scope"] for group in normalised):
+            raise ValueError("Coverage plan contains an incomplete group.")
+        return normalised
+    except Exception:
+        return _fallback_coverage_groups(requirement_text)
+
+
+def _generate_coverage_group(
+    client: OpenAI,
+    requirement_text: str,
+    few_shot: str,
+    group: dict,
+    model: str,
+) -> dict:
+    group_prompt = f"""Generate complete test cases only for the assigned coverage group below.
+
+Do not omit any explicit condition, validation, visibility rule, boundary, dependency, or state change in the assigned group. Do not generate cases that belong exclusively to the other coverage group.
+
+Assigned group: {group['name']}
+Assigned scope:
+{group['scope']}
+
+Full requirement source (use it only to understand the assigned scope and its dependencies):
+{requirement_text}
+"""
+    return _generate_test_case_batch(
+        client,
+        group_prompt,
+        few_shot,
+        images=None,
+        model=model,
+        max_tokens=LONG_REQUIREMENT_BATCH_TOKENS,
+    )
+
+
 def generate_test_cases(
     client: OpenAI,
     requirement_text: str,
     few_shot: str,
     images: list[tuple[str, bytes]] | None = None,
     model: str = MODEL,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict:
-    """Generate complete coverage, batching long stories to prevent output loss."""
-    chunks = _split_requirement_for_generation(requirement_text)
-    if len(chunks) == 1:
+    """Generate complete coverage, parallelizing two groups for detailed stories."""
+    if len(requirement_text) <= LONG_REQUIREMENT_THRESHOLD:
         return _generate_test_case_batch(client, requirement_text, few_shot, images, model)
 
-    results = []
-    for batch_number, chunk in enumerate(chunks, start=1):
-        batch_prompt = (
-            f"This is part {batch_number} of {len(chunks)} of one requirement. "
-            "Generate cases only for functionality explicitly present in this part. "
-            "Do not omit detailed conditions, validations, visibility rules, limits, "
-            "or state changes from this part, and do not recreate general cases from other parts.\n\n"
-            + chunk
-        )
-        # Images can be expensive to repeat. They are retained for a normal
-        # single-response story; detailed long stories rely on their written
-        # requirements unless their image source is split in a future pass.
-        results.append(_generate_test_case_batch(client, batch_prompt, few_shot, None, model))
+    if progress_callback:
+        progress_callback("Planning complete coverage for this detailed requirement...")
+    groups = _plan_coverage_groups(client, requirement_text, model)
+    if progress_callback:
+        progress_callback("Generating two focused coverage groups in parallel...")
+
+    results: list[dict | None] = [None, None]
+    failures: list[int] = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            executor.submit(_generate_coverage_group, client, requirement_text, few_shot, group, model): index
+            for index, group in enumerate(groups)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception:
+                failures.append(index)
+
+    # Free models can reject simultaneous calls. Keep NVIDIA usable by retrying
+    # only a throttled/failed group sequentially rather than losing the run.
+    for index in failures:
+        if progress_callback:
+            progress_callback(f"Retrying coverage group {index + 1} after provider throttling...")
+        results[index] = _generate_coverage_group(client, requirement_text, few_shot, groups[index], model)
+
+    if progress_callback:
+        progress_callback("Combining coverage groups and validating the workbook data...")
+    results = [result for result in results if result is not None]
     return _merge_generated_batches(results)
 
 

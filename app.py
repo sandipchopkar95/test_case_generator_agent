@@ -299,6 +299,7 @@ if generate_clicked:
                     few_shot + learning_context,
                     images=figma_images,
                     model=selected_model,
+                    progress_callback=generation_status.write,
                 )
                 generation_status.write(f"Generated {len(result.get('test_cases', []))} scenarios. Building workbook...")
                 progress_bar.progress(75, text="Building the Excel workbook...")
