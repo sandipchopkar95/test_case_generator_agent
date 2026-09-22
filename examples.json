@@ -1,32 +1,71 @@
 [
   {
-    "id": "TC-EXAMPLE-1",
-    "title": "User can log in with valid credentials",
-    "requirement_ref": "Login flow",
-    "preconditions": "User has an active, verified account",
+    "scenario": "Verify that Client Representative can view Resident Overview with correct breadcrumb navigation",
+    "description": "Validate that the Resident Overview page loads with the breadcrumb Home > Residences > Residents > Resident Name for an onboarded resident.",
+    "preconditions": "Client Representative is logged in. A resident record exists and is onboarded.",
     "steps": [
-      "Navigate to the login page",
-      "Enter a valid registered email",
-      "Enter the correct password",
-      "Click 'Log in'"
+      {
+        "name": "Navigate to Resident Overview",
+        "instruction": "Navigate to the Residences module, select Residents, and click a resident.",
+        "expected_result": "The Resident Overview page loads for the selected resident."
+      },
+      {
+        "name": "Verify Breadcrumb Navigation",
+        "instruction": "Observe the breadcrumb at the top of the page.",
+        "expected_result": "Breadcrumb displays Home Icon > Residences > Residents > Resident Name."
+      }
     ],
-    "expected_result": "User is redirected to the dashboard and sees their account name in the header",
     "priority": "High",
-    "type": "Functional"
+    "test_type": "UI",
+    "is_negative_case": "No",
+    "automation_candidate": "Yes"
   },
   {
-    "id": "TC-EXAMPLE-2",
-    "title": "User cannot log in with incorrect password",
-    "requirement_ref": "Login flow",
-    "preconditions": "User has an active account",
+    "scenario": "Verify that Overview tab is selected by default on Resident Overview page",
+    "description": "Ensure the Overview tab is active when the Resident Overview page loads and the other tabs are not selected.",
+    "preconditions": "Client Representative navigates to the Resident Overview page.",
     "steps": [
-      "Navigate to the login page",
-      "Enter a valid registered email",
-      "Enter an incorrect password",
-      "Click 'Log in'"
+      {
+        "name": "Check Default Tab Selection",
+        "instruction": "Observe the tab bar on the Resident Overview page.",
+        "expected_result": "Overview is highlighted as the selected tab. Calendar, Notes, and Activity Feed are visible but not selected."
+      }
     ],
-    "expected_result": "Login is rejected with a generic 'Invalid email or password' error; no indication of which field was wrong",
     "priority": "High",
-    "type": "Negative"
+    "test_type": "UI",
+    "is_negative_case": "No",
+    "automation_candidate": "Yes"
+  },
+  {
+    "scenario": "Verify that Resident profile header displays required resident information",
+    "description": "Confirm the profile header displays profile picture or initials, resident name, unit details, contact number, and email for a resident with complete data.",
+    "preconditions": "User is on Resident Overview for a resident with profile, unit, contact, and email data.",
+    "steps": [
+      {
+        "name": "Observe Resident Header",
+        "instruction": "View the resident profile header.",
+        "expected_result": "The header displays profile picture or initials, resident name, unit name/number, applicable floor/block/tower information, contact number, and email."
+      }
+    ],
+    "priority": "High",
+    "test_type": "UI",
+    "is_negative_case": "No",
+    "automation_candidate": "Yes"
+  },
+  {
+    "scenario": "Verify that About Resident card hides fields without values",
+    "description": "Validate that Personal Details and Additional Info display only fields with configured values and do not show empty placeholders.",
+    "preconditions": "User is on Resident Overview. The resident has Name and Move In Date but no Phone, Email, DOB, Gender, ID, or document values.",
+    "steps": [
+      {
+        "name": "Open About Resident",
+        "instruction": "Locate and expand the About Resident card.",
+        "expected_result": "The card displays the available Name and Move In Date values. Fields without values are hidden and are not shown with placeholders."
+      }
+    ],
+    "priority": "High",
+    "test_type": "Functional",
+    "is_negative_case": "No",
+    "automation_candidate": "Yes"
   }
 ]

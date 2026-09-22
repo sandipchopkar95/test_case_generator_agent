@@ -1,18 +1,47 @@
-Title: Password Reset Flow
+Title: [Client][Residences][Resident Overview]: About Resident
 
-Description:
-As a registered user, I want to reset my password via email so that I can regain access
-to my account if I forget my password.
+Jira ID: SEN2-25136
+
+Business Context:
+As a Client Representative, I need quick access to a resident's core personal,
+contact, identity, and move-in information from the Resident Overview page. The
+representative must be able to review the information and navigate to the Edit
+Resident flow when an update is required.
+
+Scope:
+- Module: Residences
+- Roles: Client Representative Admin and applicable RBAC users
+- Entry point: Resident Overview page
 
 Acceptance Criteria:
-1. User can request a password reset from the login page via a "Forgot password?" link.
-2. User enters their registered email address and submits.
-3. If the email exists in the system, a reset link is sent within 2 minutes, valid for 30 minutes.
-4. If the email does not exist, the system shows a generic message (does not reveal whether
-   the email is registered, for security reasons).
-5. Reset link takes the user to a page where they can enter a new password (min 8 characters,
-   must include at least 1 number and 1 special character).
-6. After successful reset, all existing sessions for that user are logged out.
-7. User receives a confirmation email after a successful password change.
-8. Reset link cannot be reused once it has been used successfully.
-9. Rate limit: max 3 reset requests per email per hour.
+1. Display breadcrumb navigation for the Resident Overview page:
+   Home Icon > Residences > Residents > <Resident Name>.
+2. Display the resident profile header with profile picture or initials, resident
+   name, unit name/number, applicable floor/block/tower information, contact
+   number, and email. The ellipsis menu is out of scope/TBD.
+3. Display the Overview, Calendar, Notes, and Activity Feed tabs. Overview is
+   selected by default; Calendar, Notes, and Activity Feed are separate stories.
+4. Display About Resident, Preferences, Notes, Apartments, and Activity sections.
+   Documents is out of scope for this story.
+5. Allow the left-side navigation menu to jump to the relevant page sections.
+6. Display the Resident Profile Summary panel with tags, profile link, email,
+   contact number, and linked profiles when the corresponding data exists.
+7. Display a maximum of 20 tags as full chips. Hide the tags section when no tags
+   are mapped.
+8. Display the About Resident card with an Edit button, Personal Details,
+   Additional Info, Custom Field Group when configured, and Tags when mapped.
+9. Hide fields without values. Display configured dates and phone numbers using
+   the property's configured format.
+10. Display up to 3 uploaded identity documents. Selecting a document opens its
+    preview and download experience.
+11. Long text wraps to a maximum of two lines, then uses an ellipsis and exposes
+    the full value on hover where specified.
+12. The About Resident card shows Personal Details by default. Full Information
+    expands the remaining available sections and Show Less collapses them again.
+13. The Edit button opens the Edit Resident flow. Saved changes are reflected in
+    the Resident Overview; cancelled changes are not applied.
+
+Clarifications:
+- Use only behavior stated in this requirement or its Jira comments.
+- Do not add generic API, performance, security, or unrelated regression cases.
+- Documents and the header ellipsis menu are out of scope/TBD.
