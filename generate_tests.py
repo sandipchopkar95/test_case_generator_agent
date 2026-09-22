@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from pathlib import Path
@@ -49,11 +50,15 @@ MODEL = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
 MODEL_OPTIONS = {
     "Claude": "anthropic/claude-sonnet-4.6",
     "ChatGPT": "openai/gpt-4o",
-    "NVIDIA Nemotron 3": DEFAULT_MODEL,
+    "NVIDIA Nemotron 3": MODEL,
 }
 MAX_REQUIREMENT_CHUNK_CHARS = 4_000
 LONG_REQUIREMENT_THRESHOLD = 8_000
 LONG_REQUIREMENT_BATCH_TOKENS = 12_288
+FREE_REQUIREMENT_BATCH_TOKENS = 4_096
+FREE_REQUIREMENT_CHUNK_CHARS = 1_000
+FREE_MAX_CASES_PER_BATCH = 6
+OPENROUTER_RETRY_LIMIT = 3
 
 COVERAGE_PLAN_PROMPT = """Analyze the requirement below and return ONLY valid JSON.
 
@@ -433,16 +438,32 @@ def _extract_tool_result(response) -> dict:
     """Pull the submit_test_cases arguments out of an OpenAI-style response,
     with a fallback to parsing raw JSON from the message content in case the
     model didn't use a tool call (some models are inconsistent about this)."""
-    message = response.choices[0].message
+    choices = getattr(response, "choices", None) if response is not None else None
+    if not choices:
+        response_text = str(response)[:2_000]
+        raise RuntimeError(
+            "OpenRouter returned no response choices. The provider may have stopped "
+            f"the request before generation. Response: {response_text}"
+        )
+
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        raise RuntimeError(
+            "OpenRouter returned a response without a message. "
+            f"Response: {str(response)[:2_000]}"
+        )
 
     tool_calls = getattr(message, "tool_calls", None)
     if tool_calls:
         for call in tool_calls:
-            if call.function.name == "submit_test_cases":
-                return _parse_model_json(call.function.arguments)
+            function = getattr(call, "function", None)
+            if function and getattr(function, "name", None) == "submit_test_cases":
+                arguments = getattr(function, "arguments", "")
+                if arguments:
+                    return _parse_model_json(arguments)
 
     # Fallback: model replied in plain text instead of calling the tool.
-    content = (message.content or "").strip()
+    content = str(getattr(message, "content", None) or "").strip()
     if content.startswith("```"):
         content = content.strip("`")
         if content.startswith("json"):
@@ -514,6 +535,28 @@ def _is_image_support_error(error: Exception) -> bool:
     return "image input" in message or "image support" in message or "filter by image" in message
 
 
+def _openrouter_completion(client: OpenAI, **kwargs):
+    """Retry transient OpenRouter throttling without duplicating application work."""
+    for attempt in range(OPENROUTER_RETRY_LIMIT + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as error:
+            status_code = getattr(error, "status_code", None)
+            message = str(error).casefold()
+            transient = status_code == 429 or status_code in {408, 409, 500, 502, 503, 504}
+            transient = transient or any(
+                marker in message for marker in ("rate limit", "too many requests", "timed out", "timeout")
+            )
+            if not transient or attempt >= OPENROUTER_RETRY_LIMIT:
+                raise
+            retry_after = getattr(error, "headers", {}).get("retry-after") if getattr(error, "headers", None) else None
+            try:
+                delay = min(30, max(2, float(retry_after))) if retry_after else min(30, 2 ** attempt * 2)
+            except (TypeError, ValueError):
+                delay = min(30, 2 ** attempt * 2)
+            time.sleep(delay)
+
+
 def _generate_json_fallback(
     client: OpenAI,
     requirement_text: str,
@@ -529,6 +572,7 @@ Generate the complete QA test-case object for the requirement below using exactl
 {{"test_cases": [{{"scenario": "...", "description": "...", "preconditions": "...", "steps": [{{"instruction": "...", "expected_result": "...", "name": "..."}}], "priority": "High|Medium|Low", "test_type": "UI|Functional", "is_negative_case": "Yes|No", "automation_candidate": "Yes|No"}}], "open_questions": []}}
 
 Use the complete QA rules in the system prompt. Do not invent UI text or requirements. Every step needs a specific expected result.
+Generate no more than {FREE_MAX_CASES_PER_BATCH if ':free' in model else 20} concise test cases for this request. Cover the most important distinct requirements in this scope; do not produce a long exhaustive list.
 
 Requirement:
 {requirement_text}
@@ -539,7 +583,8 @@ Requirement:
         {"role": "user", "content": _multimodal_user_content(fallback_prompt, images)},
     ]
     try:
-        response = client.chat.completions.create(
+        response = _openrouter_completion(
+            client,
             model=model,
             max_tokens=max_tokens,
             messages=messages,
@@ -550,7 +595,8 @@ Requirement:
         if images and _is_image_support_error(structured_error):
             return _generate_json_fallback(client, requirement_text, few_shot, images=None, model=model, max_tokens=max_tokens)
         try:
-            response = client.chat.completions.create(
+            response = _openrouter_completion(
+                client,
                 model=model,
                 max_tokens=max_tokens,
                 messages=messages,
@@ -571,6 +617,14 @@ def validate_generated_result(result: dict) -> dict:
 
     scenarios = set()
     for case_number, test_case in enumerate(test_cases, start=1):
+        if not isinstance(test_case, dict):
+            raise ValueError(f"Test case {case_number} is malformed.")
+        # Free-tier models occasionally omit a classification field even when
+        # the rest of the case is complete. Use conservative import-safe values.
+        test_case.setdefault("priority", "Medium")
+        test_case.setdefault("test_type", "Functional")
+        test_case.setdefault("is_negative_case", "No")
+        test_case.setdefault("automation_candidate", "No")
         for field in ("scenario", "description", "preconditions", "priority", "test_type"):
             if not str(test_case.get(field, "")).strip():
                 raise ValueError(f"Test case {case_number} is missing '{field}'.")
@@ -623,10 +677,21 @@ def _generate_test_case_batch(
     model: str = MODEL,
     max_tokens: int = 8192,
 ) -> dict:
+    if ":free" in model:
+        return _generate_json_fallback(
+            client,
+            requirement_text,
+            few_shot,
+            images,
+            model,
+            max_tokens=min(max_tokens, FREE_REQUIREMENT_BATCH_TOKENS),
+        )
+
     user_content = _multimodal_user_content(requirement_text + few_shot, images)
 
     try:
-        response = client.chat.completions.create(
+        response = _openrouter_completion(
+            client,
             model=model,
             max_tokens=max_tokens,
             messages=[
@@ -638,7 +703,8 @@ def _generate_test_case_batch(
         )
     except Exception as error:
         if images and _is_image_support_error(error):
-            response = client.chat.completions.create(
+            response = _openrouter_completion(
+                client,
                 model=model,
                 max_tokens=max_tokens,
                 messages=[
@@ -657,14 +723,17 @@ def _generate_test_case_batch(
         return _generate_json_fallback(client, requirement_text, few_shot, images, model, max_tokens=max_tokens)
 
 
-def _split_requirement_for_generation(requirement_text: str) -> list[str]:
+def _split_requirement_for_generation(
+    requirement_text: str,
+    max_chars: int = MAX_REQUIREMENT_CHUNK_CHARS,
+) -> list[str]:
     """Split long PRDs on paragraph boundaries so one response is not truncated.
 
     A very detailed story can require more output than a provider permits in one
     response. Each returned batch is independently valid, then all batches are
     merged below. Short stories retain the existing single-request behavior.
     """
-    if len(requirement_text) <= MAX_REQUIREMENT_CHUNK_CHARS:
+    if len(requirement_text) <= max_chars:
         return [requirement_text]
 
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", requirement_text) if part.strip()]
@@ -674,12 +743,20 @@ def _split_requirement_for_generation(requirement_text: str) -> list[str]:
     current_length = 0
     for paragraph in paragraphs:
         paragraph_length = len(paragraph) + 2
-        if current and current_length + paragraph_length > MAX_REQUIREMENT_CHUNK_CHARS:
+        if paragraph_length > max_chars:
+            if current:
+                chunks.append("\n\n".join(current))
+                current = []
+                current_length = 0
+            chunks.extend(
+                paragraph[start : start + max_chars]
+                for start in range(0, len(paragraph), max_chars)
+            )
+            continue
+        if current and current_length + paragraph_length > max_chars:
             chunks.append("\n\n".join(current))
             current = []
             current_length = 0
-        # An unusually long paragraph is still kept intact; breaking a
-        # requirement sentence risks splitting its condition from its outcome.
         current.append(paragraph)
         current_length += paragraph_length
     if current:
@@ -711,19 +788,25 @@ def _merge_generated_batches(results: list[dict]) -> dict:
 
 
 def _fallback_coverage_groups(requirement_text: str) -> list[dict]:
-    """Create two balanced scopes without an AI planning response if needed."""
-    chunks = _split_requirement_for_generation(requirement_text)
-    midpoint = max(1, (len(chunks) + 1) // 2)
+    """Create bounded scopes without an AI planning response if needed."""
+    chunks = _split_requirement_for_generation(
+        requirement_text,
+        max_chars=FREE_REQUIREMENT_CHUNK_CHARS,
+    )
     return [
-        {"name": "Requirement coverage group 1", "scope": "\n\n".join(chunks[:midpoint])},
-        {"name": "Requirement coverage group 2", "scope": "\n\n".join(chunks[midpoint:])},
+        {
+            "name": "Complete requirement" if len(chunks) == 1 else f"Requirement coverage chunk {index}",
+            "scope": chunk,
+        }
+        for index, chunk in enumerate(chunks, start=1)
     ]
 
 
 def _plan_coverage_groups(client: OpenAI, requirement_text: str, model: str) -> list[dict]:
     """Use a small response to assign the full requirement to two QA scopes."""
     try:
-        response = client.chat.completions.create(
+        response = _openrouter_completion(
+            client,
             model=model,
             max_tokens=1200,
             messages=[{"role": "user", "content": COVERAGE_PLAN_PROMPT.format(requirement=requirement_text)}],
@@ -754,7 +837,8 @@ def _generate_coverage_group(
 ) -> dict:
     group_prompt = f"""Generate complete test cases only for the assigned coverage group below.
 
-Do not omit any explicit condition, validation, visibility rule, boundary, dependency, or state change in the assigned group. Do not generate cases that belong exclusively to the other coverage group.
+    Do not omit any explicit condition, validation, visibility rule, boundary, dependency, or state change in the assigned group. Do not generate cases that belong exclusively to the other coverage group.
+    Generate no more than {FREE_MAX_CASES_PER_BATCH if ':free' in model else 20} concise test cases for this assigned scope. Return complete JSON before adding more cases.
 
 Assigned group: {group['name']}
 Assigned scope:
@@ -780,7 +864,8 @@ def _find_missing_coverage(client: OpenAI, requirement_text: str, result: dict, 
         for case in result.get("test_cases", [])
     ]
     try:
-        response = client.chat.completions.create(
+        response = _openrouter_completion(
+            client,
             model=model,
             max_tokens=1600,
             messages=[
@@ -834,18 +919,25 @@ def generate_test_cases(
     images: list[tuple[str, bytes]] | None = None,
     model: str = MODEL,
     progress_callback: Callable[[str], None] | None = None,
+    coverage_groups: list[dict] | None = None,
 ) -> dict:
     """Generate complete coverage, parallelizing two groups for detailed stories."""
-    if len(requirement_text) <= LONG_REQUIREMENT_THRESHOLD:
+    if len(requirement_text) <= LONG_REQUIREMENT_THRESHOLD and not (
+        ":free" in model and len(requirement_text) > FREE_REQUIREMENT_CHUNK_CHARS
+    ):
         return _generate_test_case_batch(client, requirement_text, few_shot, images, model)
 
     if progress_callback:
         progress_callback("Planning complete coverage for this detailed requirement...")
-    groups = _plan_coverage_groups(client, requirement_text, model)
+    groups = coverage_groups or (
+        _fallback_coverage_groups(requirement_text)
+        if ":free" in model
+        else _plan_coverage_groups(client, requirement_text, model)
+    )
     if progress_callback and ":free" not in model:
         progress_callback("Generating two focused coverage groups in parallel...")
 
-    results: list[dict | None] = [None, None]
+    results: list[dict | None] = [None] * len(groups)
     if ":free" in model:
         if progress_callback:
             progress_callback("Generating focused coverage groups sequentially for NVIDIA free-tier reliability...")
@@ -855,7 +947,7 @@ def generate_test_cases(
             results[index] = _generate_coverage_group(client, requirement_text, few_shot, group, model)
     else:
         failures: list[int] = []
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=min(2, len(groups))) as executor:
             futures = {
                 executor.submit(_generate_coverage_group, client, requirement_text, few_shot, group, model): index
                 for index, group in enumerate(groups)
@@ -876,6 +968,13 @@ def generate_test_cases(
         progress_callback("Combining coverage groups and validating the workbook data...")
     results = [result for result in results if result is not None]
     merged_result = _merge_generated_batches(results)
+    if ":free" in model:
+        merged_result["coverage_audit"] = {
+            "missing_points_addressed": 0,
+            "status": "skipped_for_free_tier_speed",
+        }
+        return merged_result
+
     if progress_callback:
         progress_callback("Auditing scenario traceability against the complete requirement...")
     missing_coverage = _find_missing_coverage(client, requirement_text, merged_result, model)
@@ -898,7 +997,8 @@ def self_review(client: OpenAI, requirement_text: str, result: dict, model: str 
         test_cases_json=json.dumps(result.get("test_cases", []), indent=2),
     )
 
-    response = client.chat.completions.create(
+    response = _openrouter_completion(
+        client,
         model=model,
         max_tokens=8192,
         messages=[
@@ -1180,6 +1280,8 @@ def main():
     client = OpenAI(
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
+        timeout=180,
+        max_retries=0,
     )
 
     if args.input:
@@ -1195,10 +1297,11 @@ def main():
     few_shot = load_few_shot_examples(args.examples)
     learning_context = ""
     reference_count = 0
-    learning_repository = create_learning_repository(
-        args.mongodb_uri, args.mongodb_database, args.learning_store
-    )
+    learning_repository = None
     if not args.no_learning:
+        learning_repository = create_learning_repository(
+            args.mongodb_uri, args.mongodb_database, args.learning_store
+        )
         learning_context, reference_count = build_learning_context(
             requirement_text, learning_repository
         )
