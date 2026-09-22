@@ -190,7 +190,7 @@ with st.sidebar:
         help="Uploaded images are sent to the model as visual source material for UI test coverage.",
     )
     template_upload = st.file_uploader("Excel template (optional)", type=["xlsx"])
-    examples_path = Path(__file__).with_name("examples.json")
+    examples_path = Path(__file__).with_name("sample_test_cases.xlsx")
     use_examples = st.checkbox("Use team examples", value=examples_path.exists())
 
     st.divider()

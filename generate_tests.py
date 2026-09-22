@@ -198,6 +198,8 @@ SYSTEM_PROMPT = """You are a senior QA engineer generating detailed manual test 
 
 You are generating an execution-ready QA workbook. Analyze the feature before writing cases: identify actors and roles, entry points, pages, fields, controls, business rules, validations, dependencies, permissions, status transitions, related modules, data relationships, boundary values, error states, navigation paths, persistence, integrations, UI requirements, automation opportunities, and regression impact.
 
+For a focused Jira story, stay strictly within the feature and acceptance criteria described in that story. Do not generate generic regression, performance, API, security, cross-module, or unrelated navigation cases unless the story explicitly requires them. Prefer a smaller set of distinct, execution-ready cases over exhaustive repetition. Use the approved team workbook examples as a style and granularity reference, not as additional requirements.
+
 Uploaded Figma screenshots or UI reference images are authoritative visual source material when provided. Use only text and visual details that are readable in the images. Do not invent UI labels, messages, controls, limits, or behavior that cannot be established from the story, requirements, comments, or images.
 
 Jira comments are included under `Comments / Clarifications`. Treat comments as authoritative clarifications or supplementary requirements when they resolve an ambiguity or gap in the story. Do not treat unrelated discussion, status updates, or opinions as requirements. If comments conflict with the story or acceptance criteria, flag the conflict in `open_questions` instead of silently choosing one.
@@ -291,15 +293,69 @@ def _normalise_step_name(name: str, instruction: str) -> str:
     return candidate[:80].strip()
 
 
+def _load_workbook_examples(path: Path, limit: int = 8) -> list[dict]:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    worksheet = workbook.active
+    headers = [cell.value for cell in next(worksheet.iter_rows())]
+    column_index = {str(header): index for index, header in enumerate(headers) if header}
+    required = {
+        "ID",
+        "Scenario",
+        "Description",
+        "Preconditions",
+        "Instructions (test step)",
+        "Expected results (test step)",
+        "Name (test step)",
+        "Priority",
+        "Test Type",
+    }
+    if not required.issubset(column_index):
+        raise ValueError("Workbook examples must contain the generated test-case columns.")
+
+    examples = []
+    current = None
+    for values in worksheet.iter_rows(min_row=2, values_only=True):
+        scenario = values[column_index["Scenario"]]
+        if scenario:
+            if current:
+                examples.append(current)
+                if len(examples) >= limit:
+                    break
+            current = {
+                "scenario": scenario,
+                "description": values[column_index["Description"]] or "",
+                "preconditions": values[column_index["Preconditions"]] or "",
+                "steps": [],
+                "priority": values[column_index["Priority"]] or "Medium",
+                "test_type": values[column_index["Test Type"]] or "Functional",
+            }
+        if current:
+            current["steps"].append(
+                {
+                    "name": values[column_index["Name (test step)"]] or "",
+                    "instruction": values[column_index["Instructions (test step)"]] or "",
+                    "expected_result": values[column_index["Expected results (test step)"]] or "",
+                }
+            )
+    if current and len(examples) < limit:
+        examples.append(current)
+    return examples
+
+
 def load_few_shot_examples(path: str | None) -> str:
-    """Load optional few-shot examples (your team's own test cases) to steer style/format."""
+    """Load team examples from JSON or an approved Excel workbook."""
     if not path:
         return ""
     p = Path(path)
     if not p.exists():
         print(f"Warning: few-shot examples file '{path}' not found, skipping.", file=sys.stderr)
         return ""
-    examples = json.loads(p.read_text())
+    if p.suffix.casefold() == ".xlsx":
+        examples = _load_workbook_examples(p)
+    else:
+        examples = json.loads(p.read_text())
     return (
         "\n\nHere are examples of test cases written in our team's preferred style. "
         "Match this format, tone, and level of detail:\n\n"
