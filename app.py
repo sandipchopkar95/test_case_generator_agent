@@ -37,6 +37,8 @@ from learning_memory import (
 
 SETTINGS_COOKIE = "qa_test_case_generator_settings"
 COOKIE_MAX_AGE = 10 * 365 * 24 * 60 * 60
+RUN_STATE_PATH = Path(__file__).with_name(".test_case_run").joinpath("state.json")
+RUN_OUTPUT_DIR = RUN_STATE_PATH.parent
 
 cookie_manager = stx.CookieManager(key="qa-test-case-generator-cookies")
 saved_settings = cookie_manager.get(SETTINGS_COOKIE) or {}
@@ -45,6 +47,49 @@ if isinstance(saved_settings, str):
         saved_settings = json.loads(saved_settings)
     except json.JSONDecodeError:
         saved_settings = {}
+
+
+def _save_run_state() -> None:
+    """Persist resumable workflow state without storing credentials."""
+    state = {
+        key: st.session_state[key]
+        for key in (
+            "jira_id",
+            "requirement_text",
+            "coverage_groups",
+            "few_shot",
+            "learning_context",
+            "reference_count",
+            "memory_ready",
+            "download_name",
+            "output_path",
+            "scenario_count",
+            "preview_rows",
+        )
+        if key in st.session_state
+    }
+    RUN_OUTPUT_DIR.mkdir(exist_ok=True)
+    temporary_state = RUN_STATE_PATH.with_suffix(".tmp")
+    temporary_state.write_text(json.dumps(state), encoding="utf-8")
+    temporary_state.replace(RUN_STATE_PATH)
+
+
+def _restore_run_state() -> None:
+    if st.session_state.get("run_state_restored") or not RUN_STATE_PATH.exists():
+        return
+    try:
+        state = json.loads(RUN_STATE_PATH.read_text(encoding="utf-8"))
+        if isinstance(state, dict):
+            st.session_state.update(state)
+            output_path = state.get("output_path")
+            if output_path and Path(output_path).exists():
+                st.session_state["download_bytes"] = Path(output_path).read_bytes()
+    except (OSError, json.JSONDecodeError):
+        pass
+    st.session_state["run_state_restored"] = True
+
+
+_restore_run_state()
 
 
 def _streamlit_secret(name: str) -> str:
@@ -214,6 +259,27 @@ with st.sidebar:
     if st.button("Clear past-work memory", use_container_width=True, disabled=not learned_count):
         clear_learning_records(LEARNING_REPOSITORY)
         st.rerun()
+    if st.button("Clear current run", use_container_width=True, disabled=not RUN_STATE_PATH.exists()):
+        output_path = st.session_state.get("output_path")
+        if output_path:
+            Path(output_path).unlink(missing_ok=True)
+        RUN_STATE_PATH.unlink(missing_ok=True)
+        for key in (
+            "jira_id",
+            "requirement_text",
+            "coverage_groups",
+            "few_shot",
+            "learning_context",
+            "reference_count",
+            "memory_ready",
+            "download_bytes",
+            "download_name",
+            "output_path",
+            "scenario_count",
+            "preview_rows",
+        ):
+            st.session_state.pop(key, None)
+        st.rerun()
 
 source = st.radio("Requirement source", ["Jira link", "Pasted story"], horizontal=True)
 
@@ -297,6 +363,8 @@ if retrieve_clicked:
         st.session_state.pop("learning_context", None)
         st.session_state.pop("memory_ready", None)
         st.session_state.pop("download_bytes", None)
+        st.session_state.pop("output_path", None)
+        _save_run_state()
         st.success(f"Retrieved {staged_jira_id} and created {len(coverage_groups)} coverage groups.")
     except Exception as error:
         st.error(f"Retrieval/planning failed: {error}")
@@ -320,6 +388,7 @@ if memory_clicked:
         st.session_state["learning_context"] = learning_context
         st.session_state["reference_count"] = reference_count
         st.session_state["memory_ready"] = True
+        _save_run_state()
         memory_location = "shared MongoDB" if LEARNING_REPOSITORY.is_cloud else "local memory"
         if LEARNING_REPOSITORY_ERROR:
             st.warning(f"MongoDB is unavailable, so this run uses local memory: {LEARNING_REPOSITORY_ERROR}")
@@ -378,9 +447,8 @@ if generate_clicked:
                 generation_status.write(f"Generated {len(result.get('test_cases', []))} scenarios. Building workbook...")
                 template_path = None
                 temporary_template = None
-                temporary_output = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-                output_path = Path(temporary_output.name)
-                temporary_output.close()
+                RUN_OUTPUT_DIR.mkdir(exist_ok=True)
+                output_path = RUN_OUTPUT_DIR / f"{jira_id}_test_cases.xlsx"
                 if template_upload is not None:
                     temporary_template = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
                     temporary_template.write(template_upload.getvalue())
@@ -397,13 +465,14 @@ if generate_clicked:
                 finally:
                     if temporary_template:
                         Path(temporary_template.name).unlink(missing_ok=True)
-                    output_path.unlink(missing_ok=True)
                 st.session_state["download_name"] = f"{jira_id}_test_cases.xlsx"
+                st.session_state["output_path"] = str(output_path)
                 st.session_state["scenario_count"] = len(result.get("test_cases", []))
                 st.session_state["preview_rows"] = [
                     dict(zip(WORKBOOK_COLUMNS, row))
                     for row in _build_workbook_rows(result, jira_id, metadata)
                 ]
+                _save_run_state()
                 generation_progress.progress(100, text="Generation complete")
                 generation_status.update(label=f"Test cases ready in {time.monotonic() - started_at:.1f} seconds", state="complete")
             st.success(f"Generated {st.session_state['scenario_count']} test scenarios.")
