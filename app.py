@@ -140,17 +140,20 @@ with st.sidebar:
             placeholder="Enter your Jira API token",
             help="Required when using a Jira issue link or key.",
         )
-        cookie_manager.set(
-            SETTINGS_COOKIE,
-            json.dumps(
-                {
-                    "jira_base_url": jira_base_url,
-                    "model_label": model_label,
-                }
-            ),
-            max_age=COOKIE_MAX_AGE,
-            same_site="strict",
+        settings_json = json.dumps(
+            {
+                "jira_base_url": jira_base_url,
+                "model_label": model_label,
+            }
         )
+        if st.session_state.get("saved_settings_json") != settings_json:
+            cookie_manager.set(
+                SETTINGS_COOKIE,
+                settings_json,
+                max_age=COOKIE_MAX_AGE,
+                same_site="strict",
+            )
+            st.session_state["saved_settings_json"] = settings_json
 
     st.header("Scenario defaults")
     metadata = {"Status": "Not Run"}
