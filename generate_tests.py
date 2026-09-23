@@ -14,7 +14,6 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import base64
 import json
 import os
@@ -33,7 +32,6 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.dimensions import ColumnDimension, RowDimension
 
-from learning_memory import DEFAULT_LEARNING_STORE, build_learning_context, create_learning_repository, save_generation
 
 try:
     from dotenv import load_dotenv
@@ -45,7 +43,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # Free tier by default. Swap to "nvidia/nemotron-3-ultra-550b-a55b" (paid, no
 # rate limit) via the MODEL env var if you hit free-tier limits.
-DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning:free"
 MODEL = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
 MODEL_OPTIONS = {
     "Claude": "anthropic/claude-sonnet-4.6",
@@ -56,9 +54,19 @@ MAX_REQUIREMENT_CHUNK_CHARS = 4_000
 LONG_REQUIREMENT_THRESHOLD = 8_000
 LONG_REQUIREMENT_BATCH_TOKENS = 12_288
 FREE_REQUIREMENT_BATCH_TOKENS = 4_096
+FREE_FALLBACK_MAX_TOKENS = 2_048
 FREE_REQUIREMENT_CHUNK_CHARS = 1_000
 FREE_MAX_CASES_PER_BATCH = 6
 OPENROUTER_RETRY_LIMIT = 3
+OPENROUTER_TIMEOUT_RETRY_LIMIT = 0
+
+FREE_JSON_SYSTEM_PROMPT = """Return only valid JSON. Do not include analysis, reasoning, markdown, or
+text outside the JSON object. Use exactly this shape:
+{"test_cases":[{"scenario":"...","description":"...","preconditions":"...","steps":[{"name":"Action Label","instruction":"...","expected_result":"..."}],"priority":"High|Medium|Low","test_type":"UI|Functional","is_negative_case":"Yes|No","automation_candidate":"Yes|No"}],"open_questions":[]}
+
+Every test case must have at least one step. Every step must contain non-empty
+name, instruction, and expected_result strings. Return no more than 6 concise
+test cases and do not invent requirements."""
 
 COVERAGE_PLAN_PROMPT = """Analyze the requirement below and return ONLY valid JSON.
 
@@ -603,7 +611,12 @@ def _openrouter_completion(client: OpenAI, **kwargs):
             transient = transient or any(
                 marker in message for marker in ("rate limit", "too many requests", "timed out", "timeout")
             )
-            if not transient or attempt >= OPENROUTER_RETRY_LIMIT:
+            retry_limit = (
+                OPENROUTER_TIMEOUT_RETRY_LIMIT
+                if status_code == 504 or "timeout" in message or "timed out" in message
+                else OPENROUTER_RETRY_LIMIT
+            )
+            if not transient or attempt >= retry_limit:
                 raise
             retry_after = getattr(error, "headers", {}).get("retry-after") if getattr(error, "headers", None) else None
             try:
@@ -634,8 +647,9 @@ Requirement:
 {requirement_text}
 {few_shot}
 """
+    system_prompt = FREE_JSON_SYSTEM_PROMPT if ":free" in model else SYSTEM_PROMPT + "\nReturn JSON in the user-requested shape if tool calling is unavailable."
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + "\nReturn JSON in the user-requested shape if tool calling is unavailable."},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": _multimodal_user_content(fallback_prompt, images)},
     ]
     try:
@@ -646,10 +660,30 @@ Requirement:
             messages=messages,
             response_format={"type": "json_object"},
         )
-        return validate_generated_result(_extract_tool_result(response))
+        parsed_result = _extract_tool_result(response)
+        try:
+            return validate_generated_result(parsed_result)
+        except ValueError as validation_error:
+            return _repair_generated_result(
+                client,
+                requirement_text,
+                parsed_result,
+                model,
+                validation_error,
+            )
     except Exception as structured_error:
         if images and _is_image_support_error(structured_error):
             return _generate_json_fallback(client, requirement_text, few_shot, images=None, model=model, max_tokens=max_tokens)
+        if _is_provider_unavailable(structured_error):
+            raise RuntimeError(
+                f"OpenRouter could not use model '{model}'. "
+                "The selected provider returned 404; choose another model in Settings."
+            ) from structured_error
+        if _is_provider_timeout(structured_error):
+            raise RuntimeError(
+                "OpenRouter timed out before returning test cases. "
+                "Retry this run, use a paid model, or shorten the requirement."
+            ) from structured_error
         try:
             response = _openrouter_completion(
                 client,
@@ -659,10 +693,68 @@ Requirement:
             )
             return validate_generated_result(_extract_tool_result(response))
         except Exception as plain_error:
+            if _is_provider_unavailable(plain_error):
+                raise RuntimeError(
+                    f"OpenRouter could not use model '{model}'. "
+                    "The selected provider returned 404; choose another model in Settings."
+                ) from plain_error
+            if _is_provider_timeout(plain_error):
+                raise RuntimeError(
+                    "OpenRouter timed out before returning test cases. "
+                    "Retry this run, use a paid model, or shorten the requirement."
+                ) from plain_error
             raise RuntimeError(
                 "The model returned reasoning but no structured test cases. "
                 f"JSON retry failed: {structured_error}; plain-text retry failed: {plain_error}"
             ) from plain_error
+
+
+def _is_provider_timeout(error: Exception) -> bool:
+    """Identify provider-side timeouts before reporting a parsing failure."""
+    status_code = getattr(error, "status_code", None)
+    message = str(error).casefold()
+    return status_code == 504 or "timeout" in message or "timed out" in message
+
+
+def _repair_generated_result(
+    client: OpenAI,
+    requirement_text: str,
+    result: dict,
+    model: str,
+    validation_error: ValueError,
+) -> dict:
+    """Ask the model to repair a nearly valid response without redoing analysis."""
+    repair_prompt = f"""Repair this JSON test-case object and return only valid JSON.
+
+Validation error: {validation_error}
+Every test case must contain at least one step. Every step must contain non-empty
+name, instruction, and expected_result fields. Preserve the requirements and
+do not add behavior that is absent from the source.
+
+Requirement:
+{requirement_text}
+
+JSON to repair:
+{json.dumps(result, ensure_ascii=False)}
+"""
+    response = _openrouter_completion(
+        client,
+        model=model,
+        max_tokens=FREE_FALLBACK_MAX_TOKENS if ":free" in model else 4096,
+        messages=[
+            {"role": "system", "content": FREE_JSON_SYSTEM_PROMPT if ":free" in model else SYSTEM_PROMPT},
+            {"role": "user", "content": repair_prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    return validate_generated_result(_extract_tool_result(response))
+
+
+def _is_provider_unavailable(error: Exception) -> bool:
+    """Identify a model/provider route that OpenRouter cannot serve."""
+    status_code = getattr(error, "status_code", None)
+    message = str(error).casefold()
+    return status_code == 404 or "provider returned error" in message
 
 
 def validate_generated_result(result: dict) -> dict:
@@ -740,7 +832,7 @@ def _generate_test_case_batch(
             few_shot,
             images,
             model,
-            max_tokens=min(max_tokens, FREE_REQUIREMENT_BATCH_TOKENS),
+            max_tokens=min(max_tokens, FREE_FALLBACK_MAX_TOKENS),
         )
 
     user_content = _multimodal_user_content(requirement_text + few_shot, images)
@@ -891,6 +983,27 @@ def _generate_coverage_group(
     group: dict,
     model: str,
 ) -> dict:
+    if ":free" in model:
+        # Free-tier endpoints are latency-sensitive. Each fallback group already
+        # contains a bounded requirement chunk, so sending the full story and
+        # large reference context again only increases timeout risk.
+        compact_prompt = f"""Generate up to {FREE_MAX_CASES_PER_BATCH} concise QA test cases for this requirement chunk.
+
+Return only the required JSON test-case object. Cover only behavior explicitly present in the chunk. Every case needs executable steps with observable expected results.
+
+Requirement chunk:
+{group['scope']}
+"""
+        compact_examples = ""
+        return _generate_test_case_batch(
+            client,
+            compact_prompt,
+            compact_examples,
+            images=None,
+            model=model,
+            max_tokens=FREE_FALLBACK_MAX_TOKENS,
+        )
+
     group_prompt = f"""Generate complete test cases only for the assigned coverage group below.
 
     Do not omit any explicit condition, validation, visibility rule, boundary, dependency, or state change in the assigned group. Do not generate cases that belong exclusively to the other coverage group.
@@ -1296,86 +1409,9 @@ def validate_workbook(workbook_path: str, jira_id: str, metadata: dict | None = 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate QA test cases from requirements via OpenRouter.")
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input", help="Path to a local .txt/.md file with the PRD/requirements/ticket text.")
-    source.add_argument("--story", help="Pasted Jira story or business requirement text.")
-    source.add_argument("--jira-ticket", help="Jira ticket ID to fetch, e.g. PROJ-123.")
-    parser.add_argument("--jira-id", help="Jira ID used in generated IDs, e.g. RES-123.")
-    parser.add_argument("--template", help="Optional .xlsx template with the required 21 columns.")
-    parser.add_argument("--output", default="test_cases.xlsx", help="Output workbook path (default: test_cases.xlsx)")
-    parser.add_argument("--examples", help="Optional path to a JSON file of few-shot example test cases.")
-    parser.add_argument(
-        "--learning-store",
-        default=str(DEFAULT_LEARNING_STORE),
-        help="Local JSON memory for offline use when MongoDB is not configured.",
-    )
-    parser.add_argument("--mongodb-uri", help="MongoDB Atlas URI for shared team learning memory.")
-    parser.add_argument("--mongodb-database", help="MongoDB database name (default: test-case-learning).")
-    parser.add_argument(
-        "--no-learning",
-        action="store_true",
-        help="Do not use or save local past-work references for this run.",
-    )
-    parser.add_argument(
-        "--self-review",
-        action="store_true",
-        help="Run a second pass where the model critiques and improves its own coverage.",
-    )
-    args = parser.parse_args()
+    from qa_generator.cli import run
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        print(
-            "Error: OPENROUTER_API_KEY environment variable not set.\n"
-            "Set it in a .env file (see .env.example) or with `export OPENROUTER_API_KEY=your-key`.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,
-        timeout=180,
-        max_retries=0,
-    )
-
-    if args.input:
-        requirement_text = Path(args.input).read_text()
-        jira_id = args.jira_id or "REQ"
-    elif args.story:
-        requirement_text = args.story
-        jira_id = args.jira_id or "REQ"
-    else:
-        requirement_text = fetch_jira_ticket(args.jira_ticket)
-        jira_id = extract_jira_id(args.jira_ticket)
-
-    few_shot = load_few_shot_examples(args.examples)
-    learning_context = ""
-    reference_count = 0
-    learning_repository = None
-    if not args.no_learning:
-        learning_repository = create_learning_repository(
-            args.mongodb_uri, args.mongodb_database, args.learning_store
-        )
-        learning_context, reference_count = build_learning_context(
-            requirement_text, learning_repository
-        )
-    if reference_count:
-        print(f"Using {reference_count} relevant past-work reference(s).")
-
-    print(f"Generating test cases with {MODEL}...")
-    result = generate_test_cases(client, requirement_text, few_shot + learning_context)
-
-    if args.self_review:
-        print("Running self-review pass...")
-        result = self_review(client, requirement_text, result)
-
-    write_workbook(result, args.output, jira_id, args.template)
-    if not args.no_learning:
-        save_generation(requirement_text, jira_id, result, learning_repository)
-        location = "shared cloud" if learning_repository.is_cloud else "local"
-        print(f"Saved this successful generation to {location} past-work memory.")
+    run()
 
 
 if __name__ == "__main__":
