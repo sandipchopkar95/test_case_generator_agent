@@ -49,6 +49,7 @@ MODEL_OPTIONS = {
     "Claude": "anthropic/claude-sonnet-4.6",
     "ChatGPT": "openai/gpt-4o",
     "NVIDIA Nemotron 3": MODEL,
+    "Ling 3.0 Flash VL": "inclusionai/ling-3.0-flash-vl:free",
 }
 MAX_REQUIREMENT_CHUNK_CHARS = 4_000
 LONG_REQUIREMENT_THRESHOLD = 8_000
@@ -557,6 +558,17 @@ def _parse_model_json(content: str) -> dict:
     try:
         result = json.loads(content)
     except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", content):
+            try:
+                result, _ = decoder.raw_decode(content[match.start() :])
+                break
+            except json.JSONDecodeError:
+                continue
+        else:
+            result = None
+        if isinstance(result, dict):
+            return result
         try:
             from json_repair import repair_json
 
@@ -653,13 +665,14 @@ Requirement:
         {"role": "user", "content": _multimodal_user_content(fallback_prompt, images)},
     ]
     try:
-        response = _openrouter_completion(
-            client,
-            model=model,
-            max_tokens=max_tokens,
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
+        request_options = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+        if _supports_structured_output(model):
+            request_options["response_format"] = {"type": "json_object"}
+        response = _openrouter_completion(client, **request_options)
         parsed_result = _extract_tool_result(response)
         try:
             return validate_generated_result(parsed_result)
@@ -737,16 +750,17 @@ Requirement:
 JSON to repair:
 {json.dumps(result, ensure_ascii=False)}
 """
-    response = _openrouter_completion(
-        client,
-        model=model,
-        max_tokens=FREE_FALLBACK_MAX_TOKENS if ":free" in model else 4096,
-        messages=[
+    request_options = {
+        "model": model,
+        "max_tokens": FREE_FALLBACK_MAX_TOKENS if ":free" in model else 4096,
+        "messages": [
             {"role": "system", "content": FREE_JSON_SYSTEM_PROMPT if ":free" in model else SYSTEM_PROMPT},
             {"role": "user", "content": repair_prompt},
         ],
-        response_format={"type": "json_object"},
-    )
+    }
+    if _supports_structured_output(model):
+        request_options["response_format"] = {"type": "json_object"}
+    response = _openrouter_completion(client, **request_options)
     return validate_generated_result(_extract_tool_result(response))
 
 
@@ -755,6 +769,11 @@ def _is_provider_unavailable(error: Exception) -> bool:
     status_code = getattr(error, "status_code", None)
     message = str(error).casefold()
     return status_code == 404 or "provider returned error" in message
+
+
+def _supports_structured_output(model: str) -> bool:
+    """Return whether the selected provider advertises JSON response support."""
+    return "inclusionai/ling-3.0-flash-vl" not in model.casefold()
 
 
 def validate_generated_result(result: dict) -> dict:

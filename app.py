@@ -111,7 +111,7 @@ with st.sidebar:
             st.rerun()
         configured_model_label = next(
             (label for label, model_id in MODEL_OPTIONS.items() if model_id == MODEL),
-            "NVIDIA Nemotron 3",
+            "Ling 3.0 Flash VL",
         )
         saved_model_label = saved_settings.get("model_label", configured_model_label)
         if saved_model_label not in MODEL_OPTIONS:
