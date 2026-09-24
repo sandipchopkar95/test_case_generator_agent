@@ -49,7 +49,7 @@ MODEL_OPTIONS = {
     "Claude": "anthropic/claude-sonnet-4.6",
     "ChatGPT": "openai/gpt-4o",
     "NVIDIA Nemotron 3": MODEL,
-    "Ling 3.0 Flash VL": "inclusionai/ling-3.0-flash-vl:free",
+    "Ling 3.0 Flash VL": "inclusionai/ling-3.0-flash-fin:free"
 }
 MAX_REQUIREMENT_CHUNK_CHARS = 4_000
 LONG_REQUIREMENT_THRESHOLD = 8_000
