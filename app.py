@@ -286,6 +286,12 @@ generate_clicked = st.button(
     use_container_width=True,
 )
 
+if "requirement_text" in st.session_state:
+    st.caption(f"✓ {st.session_state.get('jira_id', 'Requirement')} and coverage plan are ready.")
+if st.session_state.get("memory_ready"):
+    st.caption("✓ Past-work references are prepared; test-case generation is ready.")
+
+retrieval_succeeded = False
 if retrieve_clicked:
     try:
         if source == "Jira link":
@@ -331,8 +337,14 @@ if retrieve_clicked:
         st.session_state.pop("output_path", None)
         RUN_STATE_STORE.save(st.session_state)
         st.success(f"Retrieved {staged_jira_id} and created {len(coverage_groups)} coverage groups.")
+        retrieval_succeeded = True
     except Exception as error:
         st.error(f"Retrieval/planning failed: {error}")
+
+# The button widgets above were rendered before the handler updated session state.
+# Rerun after success so the next stage's disabled state reflects the new state.
+if retrieval_succeeded:
+    st.rerun()
 
 if st.session_state.get("coverage_groups"):
     with st.expander("Coverage plan", expanded=False):
@@ -340,6 +352,7 @@ if st.session_state.get("coverage_groups"):
             st.markdown(f"**{group['name']}**")
             st.write(group["scope"])
 
+memory_succeeded = False
 if memory_clicked:
     try:
         requirement_text = st.session_state["requirement_text"]
@@ -358,8 +371,13 @@ if memory_clicked:
         if LEARNING_REPOSITORY_ERROR:
             st.warning(f"MongoDB is unavailable, so this run uses local memory: {LEARNING_REPOSITORY_ERROR}")
         st.success(f"References prepared from {memory_location}: {reference_count} relevant record(s).")
+        memory_succeeded = True
     except Exception as error:
         st.error(f"Memory preparation failed: {error}")
+
+# Rerender the buttons now that memory_ready has been stored.
+if memory_succeeded:
+    st.rerun()
 
 if generate_clicked:
     started_at = time.monotonic()
