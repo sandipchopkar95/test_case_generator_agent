@@ -3,8 +3,8 @@
 Test Case Generation Agent
 ----------------------------------
 Reads a PRD / user story / Jira ticket text and generates structured
-QA/functional test cases using an LLM via OpenRouter (default model:
-NVIDIA Nemotron 3 Ultra).
+QA/functional test cases using OpenRouter, OpenAI, or Anthropic (OpenRouter
+remains the default provider).
 
 Usage:
     python generate_tests.py --input requirements.txt --jira-id PROJ-123 --output test_cases.xlsx
@@ -22,7 +22,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -52,6 +54,29 @@ MODEL_OPTIONS = {
     "Ling 3.0 Flash VL": "inclusionai/ling-3.0-flash-fin:free",
     "OpenRouter": "openrouter/free"
 }
+PROVIDER_LABELS = {
+    "OpenRouter": "openrouter",
+    "OpenAI (direct)": "openai",
+    "Anthropic (direct)": "anthropic",
+}
+PROVIDER_MODEL_OPTIONS = {
+    "openrouter": MODEL_OPTIONS,
+    "openai": {"GPT-4o": "gpt-4o", "GPT-4.1": "gpt-4.1"},
+    "anthropic": {"Claude Sonnet 4.6": "claude-sonnet-4-6"},
+}
+PROVIDER_API_KEY_ENV = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
+DEFAULT_PROVIDER = os.environ.get("AI_PROVIDER", "openrouter").casefold()
+if DEFAULT_PROVIDER not in PROVIDER_MODEL_OPTIONS:
+    DEFAULT_PROVIDER = "openrouter"
+DEFAULT_MODELS = {
+    "openrouter": MODEL,
+    "openai": os.environ.get("OPENAI_MODEL", "gpt-4o"),
+    "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+}
 MAX_REQUIREMENT_CHUNK_CHARS = 4_000
 LONG_REQUIREMENT_THRESHOLD = 8_000
 LONG_REQUIREMENT_BATCH_TOKENS = 12_288
@@ -61,6 +86,41 @@ FREE_REQUIREMENT_CHUNK_CHARS = 1_000
 FREE_MAX_CASES_PER_BATCH = 6
 OPENROUTER_RETRY_LIMIT = 3
 OPENROUTER_TIMEOUT_RETRY_LIMIT = 0
+
+
+@dataclass
+class ModelClient:
+    """Provider-tagged client shared by OpenRouter, OpenAI, and Anthropic."""
+
+    provider: str
+    sdk_client: object
+
+
+def create_model_client(provider: str, api_key: str | None = None, timeout: int = 180) -> ModelClient:
+    """Create a direct provider client without routing OpenAI/Claude through OpenRouter."""
+    provider = provider.casefold()
+    if provider not in PROVIDER_API_KEY_ENV:
+        raise ValueError(f"Unsupported AI provider: {provider}")
+    token = api_key or os.environ.get(PROVIDER_API_KEY_ENV[provider])
+    if not token:
+        raise ValueError(f"Set {PROVIDER_API_KEY_ENV[provider]} or enter that provider's API key.")
+
+    if provider == "anthropic":
+        try:
+            from anthropic import Anthropic
+        except ImportError as error:
+            raise RuntimeError("Install the anthropic package to use Claude directly.") from error
+        sdk_client = Anthropic(api_key=token, timeout=timeout, max_retries=0)
+    elif provider == "openrouter":
+        sdk_client = OpenAI(
+            base_url=OPENROUTER_BASE_URL,
+            api_key=token,
+            timeout=timeout,
+            max_retries=0,
+        )
+    else:
+        sdk_client = OpenAI(api_key=token, timeout=timeout, max_retries=0)
+    return ModelClient(provider=provider, sdk_client=sdk_client)
 
 FREE_JSON_SYSTEM_PROMPT = """Return only valid JSON. Do not include analysis, reasoning, markdown, or
 text outside the JSON object. Use exactly this shape:
@@ -132,7 +192,7 @@ DEFAULT_METADATA = {
 }
 
 # JSON schema the model must return test cases in, expressed as an
-# OpenAI-style function/tool definition (OpenRouter is OpenAI-compatible).
+# OpenAI-style function/tool definition, translated for Anthropic when needed.
 # ---------------------------------------------------------------------------
 TEST_CASE_TOOL = {
     "type": "function",
@@ -508,14 +568,14 @@ def _extract_tool_result(response) -> dict:
     if not choices:
         response_text = str(response)[:2_000]
         raise RuntimeError(
-            "OpenRouter returned no response choices. The provider may have stopped "
+            "The AI provider returned no response choices. It may have stopped "
             f"the request before generation. Response: {response_text}"
         )
 
     message = getattr(choices[0], "message", None)
     if message is None:
         raise RuntimeError(
-            "OpenRouter returned a response without a message. "
+            "The AI provider returned a response without a message. "
             f"Response: {str(response)[:2_000]}"
         )
 
@@ -612,13 +672,108 @@ def _is_image_support_error(error: Exception) -> bool:
     return "image input" in message or "image support" in message or "filter by image" in message
 
 
-def _openrouter_completion(client: OpenAI, **kwargs):
-    """Retry transient OpenRouter throttling without duplicating application work."""
+def _anthropic_content(content):
+    """Translate OpenAI-style text/image content into Anthropic message blocks."""
+    if isinstance(content, str):
+        return content
+    blocks = []
+    for item in content or []:
+        if item.get("type") == "text":
+            blocks.append({"type": "text", "text": item.get("text", "")})
+            continue
+        if item.get("type") != "image_url":
+            continue
+        image_url = item.get("image_url", {}).get("url", "")
+        match = re.fullmatch(r"data:(image/[\w.+-]+);base64,(.+)", image_url, re.DOTALL)
+        if not match:
+            raise ValueError("Anthropic image inputs must be provided as base64 data URLs.")
+        blocks.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": match.group(1),
+                    "data": match.group(2),
+                },
+            }
+        )
+    return blocks
+
+
+def _anthropic_completion(sdk_client, **kwargs):
+    """Call Anthropic Messages and normalize its response for existing parsers."""
+    messages = kwargs.pop("messages", [])
+    system_parts = [
+        str(message.get("content", ""))
+        for message in messages
+        if message.get("role") == "system"
+    ]
+    anthropic_messages = [
+        {"role": message["role"], "content": _anthropic_content(message.get("content", ""))}
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+    ]
+    anthropic_kwargs = {
+        "model": kwargs["model"],
+        "max_tokens": kwargs.get("max_tokens", 8192),
+        "messages": anthropic_messages,
+    }
+    if system_parts:
+        anthropic_kwargs["system"] = "\n\n".join(system_parts)
+
+    tools = []
+    for tool in kwargs.get("tools", []):
+        function = tool.get("function", {})
+        if function:
+            tools.append(
+                {
+                    "name": function["name"],
+                    "description": function.get("description", ""),
+                    "input_schema": function.get("parameters", {"type": "object", "properties": {}}),
+                }
+            )
+    if tools:
+        anthropic_kwargs["tools"] = tools
+    tool_choice = kwargs.get("tool_choice")
+    if tool_choice and tool_choice.get("type") == "function":
+        anthropic_kwargs["tool_choice"] = {
+            "type": "tool",
+            "name": tool_choice["function"]["name"],
+        }
+
+    response = sdk_client.messages.create(**anthropic_kwargs)
+    text_parts = []
+    tool_calls = []
+    for index, block in enumerate(getattr(response, "content", []) or []):
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            text_parts.append(getattr(block, "text", ""))
+        elif block_type == "tool_use":
+            tool_calls.append(
+                SimpleNamespace(
+                    id=getattr(block, "id", f"tool-{index}"),
+                    type="function",
+                    function=SimpleNamespace(
+                        name=getattr(block, "name", ""),
+                        arguments=json.dumps(getattr(block, "input", {}), ensure_ascii=False),
+                    ),
+                )
+            )
+    message = SimpleNamespace(content="\n".join(text_parts), tool_calls=tool_calls)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def _openrouter_completion(client, **kwargs):
+    """Dispatch provider calls and retry transient throttling without duplicating work."""
     for attempt in range(OPENROUTER_RETRY_LIMIT + 1):
         try:
-            return client.chat.completions.create(**kwargs)
+            provider = getattr(client, "provider", "openrouter")
+            sdk_client = getattr(client, "sdk_client", client)
+            if provider == "anthropic":
+                return _anthropic_completion(sdk_client, **kwargs)
+            return sdk_client.chat.completions.create(**kwargs)
         except Exception as error:
-            status_code = getattr(error, "status_code", None)
+            status_code = getattr(error, "status_code", getattr(error, "http_status", None))
             message = str(error).casefold()
             transient = status_code == 429 or status_code in {408, 409, 500, 502, 503, 504}
             transient = transient or any(
@@ -631,7 +786,8 @@ def _openrouter_completion(client: OpenAI, **kwargs):
             )
             if not transient or attempt >= retry_limit:
                 raise
-            retry_after = getattr(error, "headers", {}).get("retry-after") if getattr(error, "headers", None) else None
+            headers = getattr(error, "headers", None) or getattr(getattr(error, "response", None), "headers", None)
+            retry_after = headers.get("retry-after") if headers else None
             try:
                 delay = min(30, max(2, float(retry_after))) if retry_after else min(30, 2 ** attempt * 2)
             except (TypeError, ValueError):
@@ -690,13 +846,13 @@ Requirement:
             return _generate_json_fallback(client, requirement_text, few_shot, images=None, model=model, max_tokens=max_tokens)
         if _is_provider_unavailable(structured_error):
             raise RuntimeError(
-                f"OpenRouter could not use model '{model}'. "
-                "The selected provider returned 404; choose another model in Settings."
+                f"The selected provider could not use model '{model}'. "
+                "Check that the model ID is available for this API account."
             ) from structured_error
         if _is_provider_timeout(structured_error):
             raise RuntimeError(
-                "OpenRouter timed out before returning test cases. "
-                "Retry this run, use a paid model, or shorten the requirement."
+                "The AI provider timed out before returning test cases. "
+                "Retry this run or shorten the requirement."
             ) from structured_error
         try:
             response = _openrouter_completion(
@@ -709,13 +865,13 @@ Requirement:
         except Exception as plain_error:
             if _is_provider_unavailable(plain_error):
                 raise RuntimeError(
-                    f"OpenRouter could not use model '{model}'. "
-                    "The selected provider returned 404; choose another model in Settings."
+                    f"The selected provider could not use model '{model}'. "
+                    "Check that the model ID is available for this API account."
                 ) from plain_error
             if _is_provider_timeout(plain_error):
                 raise RuntimeError(
-                    "OpenRouter timed out before returning test cases. "
-                    "Retry this run, use a paid model, or shorten the requirement."
+                    "The AI provider timed out before returning test cases. "
+                    "Retry this run or shorten the requirement."
                 ) from plain_error
             raise RuntimeError(
                 "The model returned reasoning but no structured test cases. "
@@ -766,7 +922,7 @@ JSON to repair:
 
 
 def _is_provider_unavailable(error: Exception) -> bool:
-    """Identify a model/provider route that OpenRouter cannot serve."""
+    """Identify a model ID that the selected provider cannot serve."""
     status_code = getattr(error, "status_code", None)
     message = str(error).casefold()
     return status_code == 404 or "provider returned error" in message

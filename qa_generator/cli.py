@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 from pathlib import Path
-
-from openai import OpenAI
 
 from learning_memory import (
     DEFAULT_LEARNING_STORE,
@@ -20,22 +16,31 @@ from learning_memory import (
 def run() -> None:
     """Parse CLI arguments and execute one generation run."""
     from generate_tests import (
-        MODEL,
-        OPENROUTER_BASE_URL,
+        DEFAULT_MODELS,
+        DEFAULT_PROVIDER,
+        PROVIDER_API_KEY_ENV,
         extract_jira_id,
         fetch_jira_ticket,
+        create_model_client,
         generate_test_cases,
         load_few_shot_examples,
         self_review,
         write_workbook,
     )
 
-    parser = argparse.ArgumentParser(description="Generate QA test cases from requirements via OpenRouter.")
+    parser = argparse.ArgumentParser(description="Generate QA test cases from requirements using a supported AI provider.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--input", help="Path to a local .txt/.md file with the PRD/requirements/ticket text.")
     source.add_argument("--story", help="Pasted Jira story or business requirement text.")
     source.add_argument("--jira-ticket", help="Jira ticket ID to fetch, e.g. PROJ-123.")
     parser.add_argument("--jira-id", help="Jira ID used in generated IDs, e.g. RES-123.")
+    parser.add_argument(
+        "--provider",
+        choices=list(PROVIDER_API_KEY_ENV),
+        default=DEFAULT_PROVIDER,
+        help="AI provider (default: %(default)s). Supply its API key through the matching environment variable.",
+    )
+    parser.add_argument("--model", help="Provider-specific model ID (defaults to the configured provider model).")
     parser.add_argument("--template", help="Optional .xlsx template with the required 21 columns.")
     parser.add_argument("--output", default="test_cases.xlsx", help="Output workbook path (default: test_cases.xlsx)")
     parser.add_argument("--examples", help="Optional path to a JSON or Excel file of few-shot examples.")
@@ -50,16 +55,11 @@ def run() -> None:
     parser.add_argument("--self-review", action="store_true", help="Run a second pass to improve coverage.")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        print(
-            "Error: OPENROUTER_API_KEY environment variable not set.\n"
-            "Set it in a .env file (see .env.example) or with `export OPENROUTER_API_KEY=your-key`.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-
-    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key, timeout=180, max_retries=0)
+    model = args.model or DEFAULT_MODELS[args.provider]
+    try:
+        client = create_model_client(args.provider, timeout=180)
+    except (RuntimeError, ValueError) as error:
+        parser.error(str(error))
     if args.input:
         requirement_text = Path(args.input).read_text(encoding="utf-8")
         jira_id = args.jira_id or "REQ"
@@ -82,11 +82,11 @@ def run() -> None:
     if reference_count:
         print(f"Using {reference_count} relevant past-work reference(s).")
 
-    print(f"Generating test cases with {MODEL}...")
-    result = generate_test_cases(client, requirement_text, few_shot + learning_context)
+    print(f"Generating test cases with {args.provider} / {model}...")
+    result = generate_test_cases(client, requirement_text, few_shot + learning_context, model=model)
     if args.self_review:
         print("Running self-review pass...")
-        result = self_review(client, requirement_text, result)
+        result = self_review(client, requirement_text, result, model=model)
 
     write_workbook(result, args.output, jira_id, args.template)
     if learning_repository is not None:

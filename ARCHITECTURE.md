@@ -13,7 +13,7 @@ The project has two entry points:
 
 `qa_generator/cli.py` owns command-line parsing and orchestration. The generation engine is imported only when the CLI runs, so `generate_tests.py` can delegate to it without a circular import.
 
-`generate_tests.py` owns the generation domain for now: Jira retrieval, OpenRouter calls, result validation, coverage planning, and workbook export. Its pure functions are covered by `tests/test_generation_contracts.py` and remain import-compatible for the Streamlit UI.
+`generate_tests.py` owns the generation domain for now: Jira retrieval, OpenRouter/OpenAI/Anthropic calls, result validation, coverage planning, and workbook export. Its provider adapter normalizes Anthropic Messages responses to the existing result contract. Its pure functions are covered by `tests/` and remain import-compatible for the Streamlit UI.
 
 `learning_memory.py` owns local and MongoDB-backed reference retrieval. Its repository behavior is covered by `tests/test_learning_memory.py`.
 

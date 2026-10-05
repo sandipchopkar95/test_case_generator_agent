@@ -13,15 +13,18 @@ import streamlit as st
 
 from generate_tests import (
     DEFAULT_METADATA,
-    MODEL,
-    MODEL_OPTIONS,
-    OpenAI,
+    DEFAULT_MODELS,
+    DEFAULT_PROVIDER,
+    PROVIDER_API_KEY_ENV,
+    PROVIDER_LABELS,
+    PROVIDER_MODEL_OPTIONS,
     WORKBOOK_COLUMNS,
     _build_workbook_rows,
     _fallback_coverage_groups,
     _plan_coverage_groups,
     extract_jira_id,
     fetch_jira_ticket,
+    create_model_client,
     generate_test_cases,
     load_few_shot_examples,
     write_workbook,
@@ -109,26 +112,44 @@ with st.sidebar:
         if st.button("Clear saved settings", use_container_width=True):
             cookie_manager.delete(SETTINGS_COOKIE)
             st.rerun()
+        provider_labels = list(PROVIDER_LABELS)
+        configured_provider_label = next(
+            (label for label, provider in PROVIDER_LABELS.items() if provider == DEFAULT_PROVIDER),
+            "OpenRouter",
+        )
+        saved_provider_label = saved_settings.get("provider_label", configured_provider_label)
+        if saved_provider_label not in PROVIDER_LABELS:
+            saved_provider_label = configured_provider_label
+        provider_label = st.selectbox(
+            "AI provider",
+            provider_labels,
+            index=provider_labels.index(saved_provider_label),
+        )
+        selected_provider = PROVIDER_LABELS[provider_label]
+        provider_models = PROVIDER_MODEL_OPTIONS[selected_provider]
         configured_model_label = next(
-            (label for label, model_id in MODEL_OPTIONS.items() if model_id == MODEL),
-            "Ling 3.0 Flash VL",
+            (label for label, model_id in provider_models.items() if model_id == DEFAULT_MODELS[selected_provider]),
+            next(iter(provider_models)),
         )
         saved_model_label = saved_settings.get("model_label", configured_model_label)
-        if saved_model_label not in MODEL_OPTIONS:
+        if saved_model_label not in provider_models:
             saved_model_label = configured_model_label
         model_label = st.selectbox(
             "AI model",
-            list(MODEL_OPTIONS),
-            index=list(MODEL_OPTIONS).index(saved_model_label),
-            help="All models are accessed through your OpenRouter API key.",
+            list(provider_models),
+            index=list(provider_models).index(saved_model_label),
         )
-        selected_model = MODEL_OPTIONS[model_label]
-        openrouter_api_key = st.text_input(
-            f"OpenRouter API key for {model_label}",
+        selected_model = provider_models[model_label]
+        provider_api_key = st.text_input(
+            f"{provider_label} API key",
             value="",
             type="password",
-            placeholder=f"Enter your OpenRouter key for {model_label}",
-            help=f"Required to use {model_label} through OpenRouter.",
+            placeholder=f"Enter your {provider_label} API key",
+            help=(
+                "Use an API key from the provider's developer console. A ChatGPT or Claude subscription/login token is not an API key."
+                if selected_provider in {"openai", "anthropic"}
+                else "Required to route model requests through OpenRouter."
+            ),
         )
         jira_base_url = st.text_input(
             "Jira base URL",
@@ -150,6 +171,7 @@ with st.sidebar:
         settings_json = json.dumps(
             {
                 "jira_base_url": jira_base_url,
+                "provider_label": provider_label,
                 "model_label": model_label,
             }
         )
@@ -288,20 +310,15 @@ if retrieve_clicked:
             staged_jira_id = extract_jira_id(jira_id)
             staged_requirement = story_text.strip()
 
-        configured_openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-        if not configured_openrouter_key:
-            st.error("Enter an OpenRouter API key in Settings.")
+        configured_api_key = provider_api_key or os.environ.get(PROVIDER_API_KEY_ENV[selected_provider])
+        if not configured_api_key:
+            st.error(f"Enter a {provider_label} API key in Settings.")
             st.stop()
 
-        if ":free" in selected_model:
+        if selected_provider == "openrouter" and ":free" in selected_model:
             coverage_groups = _fallback_coverage_groups(staged_requirement)
         else:
-            client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=configured_openrouter_key,
-                timeout=90,
-                max_retries=0,
-            )
+            client = create_model_client(selected_provider, configured_api_key, timeout=90)
             with st.spinner("Creating the coverage plan..."):
                 coverage_groups = _plan_coverage_groups(client, staged_requirement, selected_model)
 
@@ -348,18 +365,13 @@ if generate_clicked:
     started_at = time.monotonic()
     requirement_text = st.session_state["requirement_text"]
     jira_id = st.session_state["jira_id"]
-    configured_openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-    if not configured_openrouter_key:
-        st.error("Enter an OpenRouter API key in Settings.")
+    configured_api_key = provider_api_key or os.environ.get(PROVIDER_API_KEY_ENV[selected_provider])
+    if not configured_api_key:
+        st.error(f"Enter a {provider_label} API key in Settings.")
     else:
         try:
             figma_images = [(upload.name, upload.getvalue()) for upload in figma_uploads]
-            client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=configured_openrouter_key,
-                timeout=180,
-                max_retries=0,
-            )
+            client = create_model_client(selected_provider, configured_api_key, timeout=180)
             reference_count = st.session_state.get("reference_count", 0)
             reference_suffix = f" with {reference_count} relevant past-work reference(s)" if reference_count else ""
             image_suffix = f" and {len(figma_images)} visual reference(s)" if figma_images else ""
